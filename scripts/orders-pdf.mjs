@@ -23,7 +23,10 @@ async function wp(path) {
 
 // Токен ПІБ: велика перша літера, далі малі. «Свідоцтво» таким є, але стоїть
 // перед малими словами, тож не тягне за собою ім'я.
-const NAME_TOKEN = /^[А-ЯЇІЄҐA-Z][а-яіїєґa-z'’`\-]{1,}$/;
+const NAME_TOKEN = /^[А-ЯЇІЄҐA-Z][а-яіїєґa-z'’`\-]+$/;
+// Складне ім'я з дефісом («Марія-Вероніка») — велика літера після дефіса.
+const COMPOUND_TOKEN = /^[А-ЯЇІЄҐA-Z][а-яіїєґa-z'’`\-]*-[А-ЯЇІЄҐA-Z][а-яіїєґa-z'’`\-]+$/;
+const isName = (t) => NAME_TOKEN.test(t) || COMPOUND_TOKEN.test(t);
 const DIGITS_ONLY = /^\d+$/;
 const HAS_DIGIT = /\d/;
 // По батькові може бути розірване на два токени («Володимирови» + «ч»).
@@ -31,13 +34,24 @@ const NAME_TAIL = /^[а-яіїєґ]{1,2}$/;
 
 // У записі про студента: прізвище, ім'я, по батькові йдуть підряд, а перед
 // ними — номер, після них — документ. Це і відрізняє ім'я від решти тексту.
-function findNames(tokens) {
+function findNames(raw) {
+  // Ім'я з дефісом PDF розриває на два токени («Марія-» + «Вероніка»).
+  const tokens = [];
+  for (let i = 0; i < raw.length; i++) {
+    const last = tokens[tokens.length - 1];
+    if (last && /-$/.test(last) && isName(last) && isName(raw[i])) {
+      tokens[tokens.length - 1] = last + raw[i];
+      continue;
+    }
+    tokens.push(raw[i]);
+  }
+
   const found = [];
   let i = 0;
   while (i < tokens.length) {
-    if (!NAME_TOKEN.test(tokens[i])) { i++; continue; }
+    if (!isName(tokens[i])) { i++; continue; }
     let j = i;
-    while (j < tokens.length && NAME_TOKEN.test(tokens[j])) j++;
+    while (j < tokens.length && isName(tokens[j])) j++;
     let run = tokens.slice(i, j);
     if (j < tokens.length && NAME_TAIL.test(tokens[j]) && run.length >= 2) {
       run.push(tokens[j]);
