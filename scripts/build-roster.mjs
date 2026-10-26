@@ -31,8 +31,10 @@ const WRITE = args.includes('--write');
 const CONC = Number(process.env.ROSTER_CONC || 8);
 // Скільки разів повторювати запит і яка пауза між спробами. У тестах ставимо
 // малі числа, щоб не чекати реальний збій сервера.
-const ATTEMPTS = Number(process.env.ROSTER_ATTEMPTS || 5);
+const ATTEMPTS = Number(process.env.ROSTER_ATTEMPTS || 4);
 const BACKOFF_MAX = Number(process.env.ROSTER_BACKOFF_MS || 30000);
+// На скільки всі воркери завмирають, коли сервер не відповів.
+const BLOCK_MS = Number(process.env.ROSTER_BLOCK_MS || 45000);
 
 const workerSrc = readFileSync(ROOT + 'worker.js', 'utf8');
 const TOKEN = process.env.JOURNAL_API_TOKEN || workerSrc.match(/PUBLIC_JOURNAL_TOKEN = '([^']+)'/)[1];
@@ -47,6 +49,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Пауза між спробами. Коли сервер починає віддавати 525, вона зростає —
 // інакше ми просто вб'ємо його сотнями паралельних запитів.
 let backoff = 0;
+// Коли сервер лежить, стріляти по ньому не варто: усі воркери стають на
+// паузу до одного моменту, щоб не перебирати всіх студентів підряд у марний час.
+let blockedUntil = 0;
+
+async function pauseIfDown() {
+  const wait = blockedUntil - Date.now();
+  if (wait > 0) await sleep(wait);
+}
 
 // Результат запиту: {hit} — студент знайдено, {none:true} — точно немає
 // (404), {unknown:true} — сервер не відповів, треба перевірити ще раз.
@@ -54,6 +64,7 @@ async function lookup(group, last, first) {
   const url = `${API}?group=${encodeURIComponent(group)}&last_name=${encodeURIComponent(last)}&first_name=${encodeURIComponent(first)}`;
   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     if (attempt) await sleep(backoff);
+    await pauseIfDown();
     try {
       const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(20000) });
       reqs++;
@@ -87,6 +98,7 @@ async function lookup(group, last, first) {
       backoff = Math.min(BACKOFF_MAX, backoff ? backoff * 2 : 1500);
     }
   }
+  blockedUntil = Date.now() + BLOCK_MS;
   return { unknown: true };
 }
 
@@ -133,7 +145,14 @@ for (const block of raw.groups) {
   const num = String(block.num);
   const near = candidates.filter((g) => num && numOf(g) === num);
   const rest = candidates.filter((g) => !near.includes(g));
-  for (const s of block.students) tasks.push({ block, student: s, order: [...near, ...rest] });
+  const base = [...near, ...rest];
+  for (const s of block.students) {
+    // Студент зі списку груп: спершу перевіряємо групи його спеціальності,
+    // решта груп — лише якщо там нічого не знайшлося.
+    const own = (s.groups || []).filter((g) => candidates.includes(g));
+    const order = own.length ? [...own, ...base.filter((g) => !own.includes(g))] : base;
+    tasks.push({ block, student: s, order });
+  }
 }
 console.log('Крок 1: перевіряю ' + tasks.length + ' студ. у ' + candidates.length + ' групах');
 
@@ -175,6 +194,9 @@ function saveCache() {
 
 async function scan() {
   let sinceSave = 0;
+  // Кеш пишемо навіть тоді, коли скан ще не завершився: щоб збоєм або
+  // перезапуском не втратити вже перевірених студентів.
+  const timer = setInterval(saveCache, 20000);
   await pool(pending, CONC, async (t) => {
     while (t.todo.length) {
       const g = t.todo[0];
@@ -198,6 +220,7 @@ async function scan() {
     }
     if (++sinceSave >= 20) { sinceSave = 0; saveCache(); }
   });
+  clearInterval(timer);
   saveCache();
 }
 
@@ -288,7 +311,7 @@ if (WRITE && outData.groups.length) {
   for (const g of outData.groups) {
     for (const s of g.students) {
       values.push('(' + JSON.stringify(g.group) + ',' + s.student_id + ',' +
-        JSON.stringify(s.last_name) + ',' + JSON.stringify(s.first_name) + ',' + now + ')');
+        JSON.stringify(s.last_name) + ',' + JSON.stringify(s.first_name) + ",'журнал'," + now + ')');
     }
   }
   // Якщо перевірку завершили повністю, склад групи можна перезаписати: інакше
@@ -296,8 +319,9 @@ if (WRITE && outData.groups.length) {
   // лише додає рядки — старі не чіпаємо.
   const sql = [];
   if (!unresolved) {
-    for (const g of outData.groups) {
-      sql.push("DELETE FROM group_students WHERE group_code = " + JSON.stringify(g.group) + ";");
+    const touched = new Set([...outData.groups.map((g) => g.group), ...candidates]);
+    for (const g of touched) {
+      sql.push('DELETE FROM group_students WHERE group_code = ' + JSON.stringify(g) + ';');
     }
   }
   sql.push('INSERT OR REPLACE INTO group_students (group_code, student_id, last_name, first_name, found_at) VALUES\n' + values.join(',\n') + ';');
