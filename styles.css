@@ -90,6 +90,7 @@ body {
 
 .grp-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }
 .grp-row:active { transform: scale(.99); }
+.grp-row.empty-row { opacity: .62; }
 .grp-code { font-weight: 650; font-size: 15px; }
 .grp-warn:empty { display: none; }
 .grp-warn { color: var(--amber); margin-top: 6px; }

@@ -16,6 +16,11 @@ const JOURNAL_API = 'https://journal-api.sclnau.com.ua/api/v1';
 function journalApiBase(env) {
   return (env && env.JOURNAL_API_URL) || JOURNAL_API;
 }
+
+// TT_API_URL — те саме для розкладу та списку груп.
+function ttBase(env) {
+  return (env && env.TT_API_URL) || TT;
+}
 const WP = 'https://sclnau.com.ua/wp-json/wp/v2';
 
 const GOOGLE_CLIENT_ID = '510124052044-i8hhrh7s4ijmfn0jstm2hktghp94pvup.apps.googleusercontent.com';
@@ -487,18 +492,46 @@ async function groupJournal(env, db, code) {
   return payload;
 }
 
+// Список усіх груп коледжу. Кешуємо в пам'яті isolate: список не змінюється
+// між навчальними роками, а запит до коледжу — не найдешвидший.
+let collegeGroupsCache = { at: 0, list: [] };
+const COLLEGE_GROUPS_TTL = 6 * 3600 * 1000;
+
+async function collegeGroups(env) {
+  if (Date.now() - collegeGroupsCache.at < COLLEGE_GROUPS_TTL && collegeGroupsCache.list.length) {
+    return collegeGroupsCache.list;
+  }
+  try {
+    const res = await fetch(ttBase(env) + '/student/getGroups.php', { headers: { 'user-agent': 'okhttp/4.12.0' } });
+    if (!res.ok) return collegeGroupsCache.list;
+    const data = await res.json();
+    const list = [];
+    for (const f of data.groups || []) for (const g of f.groups || []) list.push(g);
+    if (list.length) collegeGroupsCache = { at: Date.now(), list };
+    return list;
+  } catch (e) {
+    return collegeGroupsCache.list;
+  }
+}
+
 async function handleRoster(request, env, url) {
   if (!env.DB) return json({ error: 'Ростер недоступний' }, 503);
   const db = env.DB;
   const rest = url.pathname.slice('/api/roster'.length).split('/').filter(Boolean);
   const code = normalizeGroupCode(decodeURIComponent(rest[0] || ''));
 
-  // GET /api/roster — групи, для яких є ростер
+  // GET /api/roster — усі групи коледжу; count = 0, якщо склад ще не зібрано
   if (!code) {
     const res = await db.prepare(
-      'SELECT group_code, COUNT(*) AS count FROM group_students GROUP BY group_code ORDER BY group_code'
+      'SELECT group_code, COUNT(*) AS count FROM group_students GROUP BY group_code'
     ).all();
-    return json({ groups: res.results || [] });
+    const counts = new Map((res.results || []).map((r) => [r.group_code, r.count]));
+    const all = await collegeGroups(env);
+    const codes = [...new Set([...all, ...counts.keys()])].sort();
+    return json({
+      groups: codes.map((g) => ({ group_code: g, count: counts.get(g) || 0 })),
+      collected: counts.size,
+    });
   }
 
   // GET /api/roster/:code — склад групи
@@ -659,7 +692,7 @@ export default {
       }
 
       if (pathname === '/api/groups') {
-        return passThrough(TT, '/student/getGroups.php');
+        return passThrough(ttBase(env), '/student/getGroups.php');
       }
       if (pathname === '/api/dates') {
         return passThrough(TT, '/getScheduleDates.php');

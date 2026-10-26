@@ -13,9 +13,11 @@ import { fileURLToPath } from 'node:url';
 
 const JOURNAL_PORT = 8793;
 const WORKER_PORT = 8794;
+const TT_PORT = 8792;
 const PERSIST = '.wrangler/roster-test-state';
 
 const GROUP = 'Т-11';
+const OTHER_GROUP = 'Т-21';
 const STUDENT = { lastName: 'Тест', firstName: 'Студент' };
 const STUDENT2 = { lastName: 'Другий', firstName: 'Учень' };
 
@@ -87,6 +89,13 @@ const journal = createServer((req, res) => {
 });
 await new Promise((r) => journal.listen(JOURNAL_PORT, r));
 
+// Список груп коледжу — щоб тест не ходив у справжній коледж.
+const tt = createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ status: true, groups: [{ groups: [GROUP, OTHER_GROUP] }] }));
+});
+await new Promise((r) => tt.listen(TT_PORT, r));
+
 const cwd = fileURLToPath(new URL('..', import.meta.url));
 const WRANGLER = 'node_modules/wrangler/bin/wrangler.js';
 
@@ -96,6 +105,7 @@ rmSync(new URL('../' + PERSIST, import.meta.url), { recursive: true, force: true
 const worker = spawn(process.execPath, [
   WRANGLER, 'dev', '--port', String(WORKER_PORT), '--local', '--persist-to', PERSIST,
   '--var', 'JOURNAL_API_URL:http://localhost:' + JOURNAL_PORT + '/api/v1',
+  '--var', 'TT_API_URL:http://localhost:' + TT_PORT,
 ], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
 const workerLog = [];
 worker.stdout.on('data', (d) => workerLog.push(String(d)));
@@ -147,11 +157,12 @@ try {
   const oldPostBody = await oldPost.json();
   check('створення групи недоступне', String(!!oldPostBody.token), 'false');
 
-  // --- ростер порожній ---
+  // --- ростер порожній: список груп коледжу вже видно, але складів ще немає ---
   const emptyRoster = await api('GET', '/api/roster');
   const emptyBody = await emptyRoster.json();
   check('GET /api/roster', emptyRoster.status, 200);
-  check('спочатку ростер порожній', String((emptyBody.groups || []).length), '0');
+  check('у списку всі групи коледжу', String((emptyBody.groups || []).length), '2');
+  check('складів ще немає', String((emptyBody.groups || []).every((g) => !g.count)), 'true');
 
   // --- наповнюємо ростер, як це робить scripts/build-roster.mjs ---
   const seed = spawnSync(process.execPath, [
@@ -169,9 +180,12 @@ try {
   // --- список груп ---
   const list = await api('GET', '/api/roster');
   const listBody = await list.json();
-  check('у списку одна група', String((listBody.groups || []).length), '1');
-  check('код групи', listBody.groups[0].group_code, GROUP);
-  check('кількість студентів', String(listBody.groups[0].count), '2');
+  check('у списку всі групи коледжу', String((listBody.groups || []).length), '2');
+  const filled = (listBody.groups || []).find((g) => g.group_code === GROUP);
+  const empty = (listBody.groups || []).find((g) => g.group_code === OTHER_GROUP);
+  check('код групи', filled.group_code, GROUP);
+  check('кількість студентів', String(filled.count), '2');
+  check('група без складу — нуль', String(empty.count), '0');
 
   // --- склад групи ---
   const roster = await api('GET', '/api/roster/' + encodeURIComponent(GROUP));
@@ -245,6 +259,7 @@ try {
 } finally {
   worker.kill();
   journal.close();
+  tt.close();
   console.log(failed ? '\n' + failed + ' перевірок впало' : '\nУсі перевірки пройдено');
   process.exit(failed ? 1 : 0);
 }

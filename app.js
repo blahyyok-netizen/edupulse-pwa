@@ -906,9 +906,9 @@ function drawGroupHome(el) {
     const shown = q ? groups.filter((g) => g.group_code.toUpperCase().includes(q)) : groups;
     if (!shown.length) { empty(list, 'Немає груп за цим запитом'); return; }
     list.innerHTML = shown.map((g) =>
-      '<button class="card grp-row" data-code="' + esc(g.group_code) + '">' +
+      '<button class="card grp-row' + (g.count ? '' : ' empty-row') + '" data-code="' + esc(g.group_code) + '">' +
       '<span class="grp-code">' + esc(g.group_code) + '</span>' +
-      '<span class="muted small">' + g.count + ' студ.</span></button>').join('');
+      '<span class="muted small">' + (g.count ? g.count + ' студ.' : 'склад ще не зібрано') + '</span></button>').join('');
     list.querySelectorAll('.grp-row').forEach((b) => {
       b.onclick = () => { location.hash = '#/group/' + encodeURIComponent(b.dataset.code); };
     });
@@ -1021,6 +1021,8 @@ async function renderGroup() {
     if (!roster.length) {
       clear(el);
       el.innerHTML = '<div class="card"><div class="empty">Для групи ' + esc(code) + ' ще немає списку студентів</div>' +
+        '<div class="muted small">Склад збирається з PDF коледжу й наказів про зарахування. ' +
+        'Першокурсників випускають у вересні — їхні групи набираються першими.</div>' +
         '<button class="btn tonal block" id="gBack">До списку груп</button></div>';
       $('gBack').onclick = () => { location.hash = '#/group'; };
       return;
