@@ -1,0 +1,8 @@
+name = "edupulse-pwa"
+main = "worker.js"
+compatibility_date = "2025-10-01"
+
+rules = [
+  { type = "Data", globs = ["**/*.png"], fallthrough = true },
+  { type = "Text", globs = ["**/*.html", "**/*.css", "**/*.js", "**/*.webmanifest"], fallthrough = true }
+]

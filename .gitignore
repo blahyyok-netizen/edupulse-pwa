@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+dev.pid
+wrangler-dev.log
+*.log
+.DS_Store
+Thumbs.db
