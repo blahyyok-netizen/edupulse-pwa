@@ -259,10 +259,36 @@ async function sendPush(env, sub, payload, keyPair) {
   return { ok: res.ok, status: res.status };
 }
 
+// Порівняння знімків: ключі сортуємо, бо порядок об'єктів залежить від порядку
+// відповіді API, а значення вже відсортовано під час збору.
+function snapshotEq(a, b) {
+  const ka = Object.keys(a).sort();
+  const kb = Object.keys(b).sort();
+  if (ka.length !== kb.length) return false;
+  for (let i = 0; i < ka.length; i++) {
+    if (ka[i] !== kb[i]) return false;
+    if (a[ka[i]] !== b[kb[i]]) return false;
+  }
+  return true;
+}
+
 // Перевіряє журнал одного підписника і надсилає сповіщення про нові оцінки.
 async function checkSubscription(env, sub, keyPair, journal) {
   const { marks, meta } = collectMarks(journal);
   const prev = sub.marks || {};
+  const prevCount = Object.keys(prev).length;
+  const newCount = Object.keys(marks).length;
+
+  // Базового знімка ще немає — зберігаємо його мовчки, без сповіщень.
+  if (!prevCount) {
+    sub.marks = pruneMarks(marks);
+    return { dead: false, changed: true, notify: false };
+  }
+  // Сервер віддав менше занять, ніж було в знімку — відповідь обрізана.
+  // Ігноруємо такий цикл, інакше наступного разу «зайві» оцінки
+  // виглядатимуть як нові й прийдуть фальшиві сповіщення.
+  if (newCount < prevCount) return { dead: false, changed: false, notify: false };
+
   const changes = [];
   for (const key of Object.keys(marks)) {
     const before = (prev[key] || '').split(RS).filter(Boolean);
@@ -290,8 +316,10 @@ async function checkSubscription(env, sub, keyPair, journal) {
     const res = await sendPush(env, sub, payload, keyPair);
     if (res.status === 404 || res.status === 410) return { dead: true };
   }
-  sub.marks = pruneMarks(marks);
-  return { dead: false };
+  const next = pruneMarks(marks);
+  const changed = !snapshotEq(prev, next);
+  sub.marks = next;
+  return { dead: false, changed, notify: changes.length > 0 };
 }
 
 export default {
@@ -546,7 +574,9 @@ export default {
           await env.PUSH_SUBS.delete(name);
           continue;
         }
-        await env.PUSH_SUBS.put(name, JSON.stringify(sub));
+        // Пишемо в KV лише коли знімок справді змінився: безкоштовний
+        // тариф дає 1000 записів на добу, а хронологія бігає двічі на годину.
+        if (res.changed) await env.PUSH_SUBS.put(name, JSON.stringify(sub));
       } catch (e) { }
     }
   },
