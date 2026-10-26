@@ -66,10 +66,9 @@ self.addEventListener('notificationclick', (e) => {
   );
 });
 
-// Приватні відповіді (з авторизацією) і помилки не кешуємо.
+// Помилки не кешуємо.
 function cacheable(res) {
   if (!res || !res.ok) return false;
-  if (res.headers.get('authorization')) return false;
   const cc = res.headers.get('cache-control') || '';
   if (/no-store|private/i.test(cc)) return false;
   return true;
@@ -91,11 +90,6 @@ self.addEventListener('fetch', (e) => {
         })
         .catch(() => caches.match('/').then((r) => r || new Response('', { status: 504 })))
     );
-    return;
-  }
-
-  if (req.headers.get('authorization')) {
-    e.respondWith(fetch(req));
     return;
   }
 

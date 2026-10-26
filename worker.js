@@ -9,10 +9,9 @@ import appleIcon from './apple-touch-icon.png';
 import { encryptPush, generateEcdhKeyPair, signVapidJwt, b64uDecode } from './webpush.mjs';
 
 const TT = 'https://tt.sclnau.com.ua';
-const TT_API = 'https://tt-api.sclnau.com.ua';
 const JOURNAL_API = 'https://journal-api.sclnau.com.ua/api/v1';
 
-// JOURNAL_API_URL — перевизначення бази журнального API для локальних тестів (mock у test/roster.e2e.mjs і test/push.e2e.mjs).
+// JOURNAL_API_URL — перевизначення бази журнального API для локальних тестів (mock у test/push.e2e.mjs).
 function journalApiBase(env) {
   return (env && env.JOURNAL_API_URL) || JOURNAL_API;
 }
@@ -23,24 +22,11 @@ function ttBase(env) {
 }
 const WP = 'https://sclnau.com.ua/wp-json/wp/v2';
 
-const GOOGLE_CLIENT_ID = '510124052044-i8hhrh7s4ijmfn0jstm2hktghp94pvup.apps.googleusercontent.com';
-const FIREBASE_API_KEY = 'AIzaSyD2QDru_xQHFAZ1rad97jnUi-DEcnTR0Rw';
-const WORKSPACE_DOMAIN = 'sclnau.com.ua';
-
 // Ключ Journal API. Публічний за своєю природою: той самий, що вбудований у мобільний
 // додаток коледжу, і доступний кожному, хто встановив застосунок.
 // Тому лежить у відкритому коді — це не витік. Якщо все ж захочеш сховати його,
 // задайте JOURNAL_API_TOKEN (wrangler secret): він матиме пріоритет.
 const PUBLIC_JOURNAL_TOKEN = 'Wx8zMVFSWqDbCwYrEhX66rYCtThPeuxHPC11SzY6Q0BDcdRycm5ta6KFrV7WcsAJ';
-
-// Публічні шляхи кабінету коледжу, які проксіюються з Bearer-токеном користувача.
-const TT_API_PATHS = {
-  '/me': '/workspace/profile',
-  '/admin-status': '/workspace/admin-status',
-  '/parent/schedule': '/parent/schedule',
-  '/parent/schedule/dates': '/parent/schedule/dates',
-  '/parent/journal': '/parent/journal',
-};
 
 // Публічний ключ VAPID — він і так роздається браузерам. Приватний лежить у секреті
 // воркера (VAPID_PRIVATE_KEY), його генерує scripts/gen-vapid-keys.mjs.
@@ -103,40 +89,13 @@ async function passThrough(upstream, pathAndQuery, opts = {}) {
   fetchOpts.headers = Object.assign({ 'user-agent': 'okhttp/4.12.0' }, opts.headers || {});
   const res = await fetch(upstream + pathAndQuery, fetchOpts);
   const text = await res.text();
-  const isPrivate = !!(opts.headers && opts.headers.authorization);
   return new Response(text, {
     status: res.status,
     headers: {
       'content-type': res.headers.get('content-type') || 'application/json',
-      'cache-control': isPrivate ? 'private, no-store' : res.ok ? 'public, max-age=60' : 'no-store',
+      'cache-control': res.ok ? 'public, max-age=60' : 'no-store',
     },
   });
-}
-
-let authConfig = null;
-async function getAuthConfig() {
-  if (authConfig) return authConfig;
-  try {
-    const res = await fetch(TT_API + '/admin/auth/config');
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.workspace_domain) authConfig = data;
-    }
-  } catch (e) { }
-  if (!authConfig) authConfig = { google_client_id: GOOGLE_CLIENT_ID, workspace_domain: WORKSPACE_DOMAIN };
-  return authConfig;
-}
-
-async function firebaseExchange(idToken, requestUri) {
-  const postBody = new URLSearchParams({ id_token: idToken, providerId: 'google.com' }).toString();
-  return fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=${FIREBASE_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ postBody, requestUri, returnIdpCredential: true, returnSecureToken: true }),
-    }
-  );
 }
 
 function assetHeaders(contentType, url) {
@@ -332,224 +291,6 @@ async function checkSubscription(env, sub, keyPair, journal) {
   return { dead: false, changed, notify: changes.length > 0 };
 }
 
-// --- Ростер і журнал групи ---
-// Склад груп — не само registrations: список збирається з PDF «Рейтинг успішності
-// студентів» коледжу, а кожне ПІБ перевіряється журнальним API (200 лише для
-// справжньої пари «група + прізвище + ім'я»). Готовий ростер лежить у D1.
-
-const GROUP_JOURNAL_PREFIX = 'gj:';
-const GROUP_JOURNAL_TTL = 6 * 3600 * 1000;
-const GROUP_FETCH_CONC = 6;
-
-function normalizeGroupCode(code) {
-  return String(code || '').trim().toUpperCase().replace(/\s+/g, '');
-}
-
-// Чисельна оцінка. «нб» (не був) та інші нечислові позначення не враховуються.
-// Порожня оцінка — це відсутність оцінки, а не нуль: Number('') дав би 0 і
-// «розтягнуло» б середній бал усіх неоцінених занять.
-function markValue(raw) {
-  if (raw == null) return null;
-  const text = String(raw).trim().replace(',', '.');
-  if (!text) return null;
-  const num = Number(text);
-  return Number.isFinite(num) ? num : null;
-}
-
-// Журнал зберігає історію, тож беремо лише поточний навчальний рік.
-// Рік у коледжі починається 1 вересня: якщо найновіша дата ще до вересня,
-// то це завершений рік і поточним вважаємо попередній.
-function academicCutoff(latest) {
-  if (!latest) return new Date().getFullYear() + '-09-01';
-  let year = Number(latest.slice(0, 4));
-  if (Number(latest.slice(5, 7)) < 9) year--;
-  return year + '-09-01';
-}
-
-function summarizeJournal(data, since) {
-  const subjects = new Map();
-  const byDiscipline = new Map();
-  const all = [];
-  for (const d of (data && data.journal) || []) {
-    const id = d.discipline_id;
-    if (!subjects.has(id)) subjects.set(id, { id, name: d.discipline || 'Предмет', teacher: d.teacher || '' });
-    for (const s of d.sessions || []) {
-      if (since && (s.date || '') < since) continue;
-      for (const e of s.entries || []) {
-        const value = markValue(e.mark && e.mark.value);
-        if (value == null) continue;
-        const item = { id, value, date: s.date || '' };
-        all.push(item);
-        if (!byDiscipline.has(id)) byDiscipline.set(id, []);
-        byDiscipline.get(id).push(item);
-      }
-    }
-  }
-  const avg = (arr) => (arr.length ? Math.round((arr.reduce((n, x) => n + x.value, 0) / arr.length) * 100) / 100 : null);
-  const marks = {};
-  for (const [id, arr] of byDiscipline) marks[id] = avg(arr);
-  return {
-    subjects: [...subjects.values()],
-    marks,
-    average: avg(all),
-    count: all.length,
-  };
-}
-
-async function fetchGroupJournals(env, code, students) {
-  const token = (env && env.JOURNAL_API_TOKEN) || PUBLIC_JOURNAL_TOKEN;
-  const raw = [];
-  let failed = 0;
-  let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(GROUP_FETCH_CONC, students.length) }, async () => {
-    while (cursor < students.length) {
-      const s = students[cursor++];
-      const q = new URLSearchParams({ group: code, last_name: s.last_name, first_name: s.first_name });
-      try {
-        const res = await fetch(journalApiBase(env) + '/journal/?' + q.toString(), {
-          headers: { 'X-Auth-Token': token, 'user-agent': 'okhttp/4.12.0' },
-        });
-        if (!res.ok) { failed++; continue; }
-        raw.push({ student: s, data: await res.json() });
-      } catch (e) { failed++; }
-    }
-  }));
-
-  // Відкидаємо минулі навчальніроки — у журналі лишаються оцінки за попередні роки.
-  let latest = '';
-  for (const r of raw) {
-    for (const d of (r.data && r.data.journal) || []) {
-      for (const s of d.sessions || []) if ((s.date || '') > latest) latest = s.date || '';
-    }
-  }
-  const since = academicCutoff(latest);
-
-  const subjects = new Map();
-  const rows = [];
-  for (const r of raw) {
-    const summary = summarizeJournal(r.data, since);
-    for (const sub of summary.subjects) if (!subjects.has(sub.id)) subjects.set(sub.id, sub);
-    rows.push({
-      student_id: r.student.student_id,
-      last_name: r.student.last_name,
-      first_name: r.student.first_name,
-      average: summary.average,
-      count: summary.count,
-      marks: summary.marks,
-    });
-  }
-  return { rows, subjects: [...subjects.values()], since, failed };
-}
-
-async function groupJournal(env, db, code) {
-  const key = GROUP_JOURNAL_PREFIX + code;
-  if (env.PUSH_SUBS) {
-    try {
-      const raw = await env.PUSH_SUBS.get(key);
-      if (raw) {
-        const cached = JSON.parse(raw);
-        if (Date.now() - cached.updated_at < GROUP_JOURNAL_TTL) {
-          cached.cached = true;
-          return cached;
-        }
-      }
-    } catch (e) { }
-  }
-
-  const res = await db.prepare(
-    'SELECT student_id, last_name, first_name FROM group_students WHERE group_code = ? ORDER BY student_id'
-  ).bind(code).all();
-  const students = res.results || [];
-  const { rows, subjects, since, failed } = await fetchGroupJournals(env, code, students);
-
-  const disciplineTotals = new Map();
-  for (const row of rows) {
-    for (const [id, value] of Object.entries(row.marks || {})) {
-      if (!disciplineTotals.has(id)) disciplineTotals.set(id, []);
-      disciplineTotals.get(id).push(value);
-    }
-  }
-  const disciplineAverage = {};
-  for (const [id, arr] of disciplineTotals) {
-    disciplineAverage[id] = Math.round((arr.reduce((n, x) => n + x, 0) / arr.length) * 100) / 100;
-  }
-  const all = rows.filter((r) => r.average != null).map((r) => r.average);
-  const payload = {
-    code,
-    updated_at: Date.now(),
-    academic_year_from: since,
-    subjects: subjects.sort((a, b) => (a.name || '').localeCompare(b.name || '')),
-    students: rows,
-    discipline_average: disciplineAverage,
-    group_average: all.length ? Math.round((all.reduce((n, x) => n + x, 0) / all.length) * 100) / 100 : null,
-    // Увесь журнал не прийшов — сервер коледжу не відповів або віддає помилку.
-    journal_error: failed > 0 && !rows.length ? 'Сервер журналу коледжу зараз недоступний' : null,
-    failed_students: failed || 0,
-  };
-  if (env.PUSH_SUBS && !payload.journal_error) {
-    try { await env.PUSH_SUBS.put(key, JSON.stringify(payload)); } catch (e) { }
-  }
-  return payload;
-}
-
-// Список усіх груп коледжу. Кешуємо в пам'яті isolate: список не змінюється
-// між навчальними роками, а запит до коледжу — не найдешвидший.
-let collegeGroupsCache = { at: 0, list: [] };
-const COLLEGE_GROUPS_TTL = 6 * 3600 * 1000;
-
-async function collegeGroups(env) {
-  if (Date.now() - collegeGroupsCache.at < COLLEGE_GROUPS_TTL && collegeGroupsCache.list.length) {
-    return collegeGroupsCache.list;
-  }
-  try {
-    const res = await fetch(ttBase(env) + '/student/getGroups.php', { headers: { 'user-agent': 'okhttp/4.12.0' } });
-    if (!res.ok) return collegeGroupsCache.list;
-    const data = await res.json();
-    const list = [];
-    for (const f of data.groups || []) for (const g of f.groups || []) list.push(g);
-    if (list.length) collegeGroupsCache = { at: Date.now(), list };
-    return list;
-  } catch (e) {
-    return collegeGroupsCache.list;
-  }
-}
-
-async function handleRoster(request, env, url) {
-  if (!env.DB) return json({ error: 'Ростер недоступний' }, 503);
-  const db = env.DB;
-  const rest = url.pathname.slice('/api/roster'.length).split('/').filter(Boolean);
-  const code = normalizeGroupCode(decodeURIComponent(rest[0] || ''));
-
-  // GET /api/roster — усі групи коледжу; count = 0, якщо склад ще не зібрано
-  if (!code) {
-    const res = await db.prepare(
-      'SELECT group_code, COUNT(*) AS count FROM group_students GROUP BY group_code'
-    ).all();
-    const counts = new Map((res.results || []).map((r) => [r.group_code, r.count]));
-    const all = await collegeGroups(env);
-    const codes = [...new Set([...all, ...counts.keys()])].sort();
-    return json({
-      groups: codes.map((g) => ({ group_code: g, count: counts.get(g) || 0 })),
-      collected: counts.size,
-    });
-  }
-
-  // GET /api/roster/:code — склад групи
-  if (rest.length === 1) {
-    const res = await db.prepare(
-      'SELECT student_id, last_name, first_name FROM group_students WHERE group_code = ? ORDER BY last_name, first_name'
-    ).bind(code).all();
-    return json({ code, students: res.results || [] });
-  }
-
-  // GET /api/roster/:code/journal — електронний журнал групи
-  if (rest.length === 2 && rest[1] === 'journal') {
-    const data = await groupJournal(env, db, code);
-    return json(data);
-  }
-
-  return json({ error: 'Not found' }, 404);
-}
 
 export default {
   async fetch(request, env, ctx) {
@@ -558,81 +299,8 @@ export default {
     const origin = url.origin;
     const journalToken = (env && env.JOURNAL_API_TOKEN) || PUBLIC_JOURNAL_TOKEN;
 
-    if (pathname === '/api/config') {
-      const cfg = await getAuthConfig();
-      return json({
-        googleClientId: cfg.google_client_id || GOOGLE_CLIENT_ID,
-        workspaceDomain: cfg.workspace_domain || WORKSPACE_DOMAIN,
-      });
-    }
-
-    if (pathname === '/api/auth' && request.method === 'POST') {
-      if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        return json({ error: 'Bad request' }, 400);
-      }
-      if (!body || !body.idToken) return json({ error: 'idToken required' }, 400);
-
-      const cfg = await getAuthConfig();
-      const domain = cfg.workspace_domain || WORKSPACE_DOMAIN;
-      // requestUri має належати Firebase-проєкту коледжу, а не домену воркера.
-      const res = await firebaseExchange(body.idToken, 'https://' + domain);
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data) {
-        return json({ error: 'Auth failed', details: data && data.error ? data.error.message : null }, res.status || 500);
-      }
-      const email = (data.email || '').toLowerCase();
-      if (!email || !email.endsWith('@' + domain)) {
-        return json({ error: 'Account not allowed', details: 'Доступ лише для акаунтів @' + domain }, 403);
-      }
-      return json({
-        idToken: data.idToken,
-        refreshToken: data.refreshToken,
-        expiresIn: data.expiresIn,
-        email: data.email || null,
-        displayName: data.displayName || null,
-        photoUrl: data.photoUrl || null,
-        localId: data.localId,
-      });
-    }
-
-    if (pathname === '/api/refresh' && request.method === 'POST') {
-      if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        return json({ error: 'Bad request' }, 400);
-      }
-      if (!body || !body.refreshToken) return json({ error: 'refreshToken required' }, 400);
-
-      const res = await fetch(
-        `https://identitytoolkit.googleapis.com/v1/accounts:refresh?key=${FIREBASE_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: body.refreshToken }),
-        }
-      );
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data) return json({ error: 'Refresh failed' }, res.status || 500);
-      return json({
-        idToken: data.id_token,
-        refreshToken: data.refresh_token,
-        expiresIn: data.expires_in,
-        userId: data.user_id,
-      });
-    }
-
     if (pathname.startsWith('/api/')) {
       const q = url.searchParams.toString();
-
-      if (pathname.startsWith('/api/roster')) {
-        return handleRoster(request, env, url);
-      }
 
       if (pathname === '/api/push/key') {
         return json({ publicKey: VAPID_PUBLIC_KEY });
@@ -727,19 +395,6 @@ export default {
       if (pathname.startsWith('/api/news/')) {
         const id = pathname.split('/')[3];
         return passThrough(WP, `/posts/${encodeURIComponent(id)}` + (q ? '?' + q : ''));
-      }
-
-      const authHeader = request.headers.get('authorization') || '';
-      const upstreamPath = TT_API_PATHS[pathname.replace(/^\/api/, '')];
-      if (upstreamPath) {
-        if (!authHeader) return json({ error: 'Not authenticated' }, 401);
-        const headers = { authorization: authHeader };
-        const init = { method: request.method, headers };
-        if (request.method !== 'GET' && request.method !== 'HEAD') {
-          headers['content-type'] = 'application/json';
-          init.body = await request.text();
-        }
-        return passThrough(TT_API, upstreamPath + (q ? '?' + q : ''), init);
       }
 
       return json({ error: 'Not found' }, 404);

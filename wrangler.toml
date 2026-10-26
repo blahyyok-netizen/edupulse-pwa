@@ -11,11 +11,5 @@ rules = [
 binding = "PUSH_SUBS"
 id = "b67009a3d60e4107bc0b2730ccd31cf7"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "edupulse"
-database_id = "4619714a-2240-4cfb-856c-4a3ace131f6b"
-migrations_dir = "migrations"
-
 [triggers]
 crons = ["23,53 * * * *"]

@@ -1,7 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const LS = {
-  token: 'ep_token', refresh: 'ep_refresh', expires: 'ep_expires',
-  profile: 'ep_profile', group: 'ep_group', theme: 'ep_theme',
+  group: 'ep_group', theme: 'ep_theme',
   mode: 'ep_mode', teacher: 'ep_teacher',
   lastName: 'ep_lastname', firstName: 'ep_firstname',
   pushCreds: 'ep_push_creds',
@@ -18,10 +17,6 @@ const TTL = {
 };
 
 const state = {
-  token: localStorage.getItem(LS.token) || null,
-  refreshToken: localStorage.getItem(LS.refresh) || null,
-  expiresAt: Number(localStorage.getItem(LS.expires) || 0),
-  profile: readJson(LS.profile, null),
   groups: [],
   teachers: [],
   contacts: null,
@@ -62,56 +57,8 @@ function cacheGet(key, ttl) {
   }
 }
 
-function saveAuth(t, r, exp) {
-  state.token = t; state.refreshToken = r;
-  state.expiresAt = Date.now() + (Number(exp || 3600) - 60) * 1000;
-  localStorage.setItem(LS.token, t);
-  localStorage.setItem(LS.refresh, r || '');
-  localStorage.setItem(LS.expires, String(state.expiresAt));
-}
-
-async function clearCaches() {
-  try {
-    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage({ type: 'clear-caches' });
-    }
-    if (window.caches) {
-      const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
-    }
-  } catch (e) { }
-}
-
-function logout() {
-  ['token', 'refresh', 'expires', 'profile'].forEach((k) => localStorage.removeItem(LS[k]));
-  Object.keys(localStorage)
-    .filter((k) => k.startsWith('ep_') && !['ep_theme', 'ep_mode', 'ep_group', 'ep_teacher', 'ep_lastname', 'ep_firstname'].includes(k))
-    .forEach((k) => localStorage.removeItem(k));
-  Object.assign(state, { token: null, refreshToken: null, profile: null, expiresAt: 0, contacts: null, payments: null });
-  clearCaches();
-  renderMore();
-}
-
 async function api(path, opts = {}) {
-  const doFetch = () => fetch(path, {
-    ...opts,
-    headers: { ...(opts.headers || {}), ...(state.token ? { authorization: 'Bearer ' + state.token } : {}) },
-  });
-  let res = await doFetch();
-  if (res.status === 401 && state.refreshToken) {
-    try {
-      const r = await fetch('/api/refresh', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ refreshToken: state.refreshToken }),
-      });
-      if (r.ok) {
-        const d = await r.json();
-        saveAuth(d.idToken, d.refreshToken, d.expiresIn);
-        res = await doFetch();
-      } else if (r.status === 400) { logout(); throw new Error('unauthorized'); }
-    } catch (e) { if (e.message === 'unauthorized') throw e; }
-  }
-  return res;
+  return fetch(path, opts);
 }
 
 async function apiJson(path, opts) {
@@ -174,111 +121,6 @@ function setView(name) {
 function loader(el) { el.innerHTML = '<div class="loader"><span></span></div>'; }
 function clear(el) { el.innerHTML = ''; }
 function empty(el, text) { el.innerHTML = '<div class="empty">' + esc(text) + '</div>'; }
-
-async function loadProfile(force) {
-  if (!state.token) return null;
-  if (state.profile && !force) return state.profile;
-  try {
-    const res = await api('/api/me');
-    if (res.ok) {
-      const data = await res.json();
-      state.profile = data;
-      localStorage.setItem(LS.profile, JSON.stringify(data));
-      if (data && data.active === false) { logout(); return null; }
-    } else if (res.status === 401 || res.status === 403) {
-      logout();
-      return null;
-    }
-  } catch (e) { }
-  return state.profile;
-}
-
-function loadGis() {
-  if (window.google && window.google.accounts && window.google.accounts.id) return Promise.resolve(true);
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://accounts.google.com/gsi/client';
-    s.async = true; s.defer = true;
-    s.onload = () => resolve(true);
-    s.onerror = () => reject(new Error('gis'));
-    document.head.appendChild(s);
-  });
-}
-
-async function setupGoogleSignIn(host) {
-  try {
-    const cfg = await apiJson('/api/config');
-    if (!cfg.googleClientId) throw new Error('no client id');
-    await loadGis();
-    window.google.accounts.id.initialize({
-      client_id: cfg.googleClientId,
-      callback: handleGoogleCredential,
-      ux_mode: 'popup',
-    });
-    window.google.accounts.id.renderButton(host, {
-      theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'filled_black' : 'outline',
-      size: 'large',
-      shape: 'pill',
-      width: 260,
-      text: 'continue_with',
-    });
-  } catch (e) {
-    host.innerHTML = '<div class="muted small">Кнопку входу не вдалося завантажити. Спробуйте пізніше або користуйтеся додатком без входу.</div>';
-  }
-}
-
-async function handleGoogleCredential(response) {
-  if (!response || !response.credential) return;
-  try {
-    const res = await fetch('/api/auth', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ idToken: response.credential }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      toast(data.error === 'Account not allowed' ? 'Доступ лише для акаунтів @sclnau.com.ua' : (data.error || 'Не вдалося увійти'), 'err');
-      return;
-    }
-    saveAuth(data.idToken, data.refreshToken, data.expiresIn);
-    await loadProfile(true);
-    toast('Вхід виконано');
-    renderMore();
-  } catch (e) {
-    toast('Помилка входу', 'err');
-  }
-}
-
-function renderLoginCard() {
-  const card = $('loginCard');
-  const profile = state.profile;
-  if (state.token && profile) {
-    const roleMap = { admin: 'Адміністратор', teacher: 'Викладач', student: 'Студент', parent: 'Батько' };
-    card.innerHTML =
-      '<div class="row" style="align-items:center;gap:14px;margin-bottom:0"><div style="flex:0 0 52px;width:52px;height:52px;border-radius:50%;background:var(--icon-bg);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:20px">' +
-      esc((profile.full_name || profile.email || '?').charAt(0)) + '</div>' +
-      '<div><div style="font-weight:650">' + esc(profile.full_name || profile.email) + '</div>' +
-      '<div class="muted small">' + esc(profile.email || '') + '</div></div></div>' +
-      '<div style="margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
-      '<div><div class="muted small">Роль</div><div>' + esc(roleMap[profile.role] || profile.role || '—') + '</div></div>' +
-      '<div><div class="muted small">Група</div><div>' + esc(localStorage.getItem(LS.group) || '—') + '</div></div>' +
-      (profile.department ? '<div><div class="muted small">Підрозділ</div><div>' + esc(profile.department) + '</div></div>' : '') +
-      '</div>' +
-      '<div class="row" style="margin-top:14px;margin-bottom:0"><button id="logoutBtn2" class="btn danger" style="background:var(--red);color:#fff">Вийти</button></div>';
-    $('logoutBtn2').onclick = logout;
-    return;
-  }
-  if (state.token && !profile) {
-    loadProfile(true).then(() => renderLoginCard());
-    card.innerHTML = '<div class="muted small">Завантаження профілю…</div>';
-    return;
-  }
-  card.innerHTML =
-    '<div style="font-weight:650">Вхід через Google</div>' +
-    '<div class="muted small" style="margin-top:4px">Доступ для акаунтів @sclnau.com.ua</div>' +
-    '<div id="gSignIn" style="margin-top:12px;display:flex;justify-content:center"></div>' +
-    '<div class="login-hint">Розклад, журнал, новини, контакти та оплата працюють <b>без входу</b>.</div>';
-  setupGoogleSignIn($('gSignIn'));
-}
 
 async function loadGroups(select, withFaculties) {
   if (!state.groups.length) {
@@ -505,17 +347,14 @@ function drawSchedule(data, fromCache) {
 
 async function renderJournal() {
   const el = $('journalList');
-  const profile = await loadProfile();
-  const managed = profile && Array.isArray(profile.managed_groups) ? profile.managed_groups.filter(Boolean) : [];
-  const group = localStorage.getItem(LS.group) || (managed.length === 1 ? managed[0] : '');
-  const first = (profile && profile.first_name) || localStorage.getItem(LS.firstName) || '';
-  const last = (profile && profile.last_name) || localStorage.getItem(LS.lastName) || '';
+  const group = localStorage.getItem(LS.group) || '';
+  const first = localStorage.getItem(LS.firstName) || '';
+  const last = localStorage.getItem(LS.lastName) || '';
 
   const head = $('journalHead');
   if (!head.dataset.ready) {
     head.innerHTML =
-      '<div class="row"><input id="jGroup" class="input" placeholder="Група" value="' + esc(group) + '"' + (managed.length ? ' list="jGroupList"' : '') + '></div>' +
-      (managed.length ? '<datalist id="jGroupList">' + managed.map((g) => '<option value="' + esc(g) + '">').join('') + '</datalist>' : '') +
+      '<div class="row"><input id="jGroup" class="input" placeholder="Група" value="' + esc(group) + '"></div>' +
       '<div class="row"><input id="jLast" class="input" placeholder="Прізвище" value="' + esc(last) + '"><input id="jFirst" class="input" placeholder="Ім\'я" value="' + esc(first) + '"></div>' +
       '<button id="jGo" class="btn block">Показати журнал</button>' +
       '<div class="muted small" style="margin-top:8px">Журнал відкривається без входу — дані з сервера коледжу.</div>' +
@@ -855,8 +694,8 @@ function drawPayments(data) {
   if (!list.length) { empty(el, 'Реквізити недоступні'); return; }
   el.innerHTML = list.map((p) => {
     const group = localStorage.getItem(LS.group) || '___';
-    const last = (state.profile && state.profile.last_name) || '___';
-    const first = (state.profile && state.profile.first_name) || '___';
+    const last = localStorage.getItem(LS.lastName) || '___';
+    const first = localStorage.getItem(LS.firstName) || '___';
     const purpose = String(p.purpose || '').replace(/%lastname%/g, last).replace(/%firstname%/g, first).replace(/%group%/g, group);
     return '<div class="card"><div class="pay-title">' + esc(p.title) + '</div>' +
       '<div class="pay-line">Одержувач: <b>' + esc(p.recipient) + '</b></div>' +
@@ -873,184 +712,16 @@ function drawPayments(data) {
 }
 
 function renderMore() {
-  renderLoginCard();
   renderContacts();
   renderPayments();
-}
-
-// --- Електронний журнал групи ---
-// Склад груп не самореєстрація: список збирається з PDF рейтингу коледжу,
-// а кожне ПІБ підтверджується журнальним API. Тому журнал групи показує
-// справжніх студентів, а не тих, хто просто вписався.
-
-const group = { code: '', data: null };
-
-async function groupApi(path) {
-  const res = await fetch(path);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
-  return data;
-}
-
-function drawGroupHome(el) {
-  el.innerHTML =
-    '<div class="card"><div class="section-title" style="margin-top:0">Журнал групи</div>' +
-    '<div class="muted small">Оберіть групу — побачите електронний журнал усіх її студентів: середні оцінки за предметами та підсумковий бал.</div>' +
-    '<div class="row" style="margin-top:12px"><input id="gSearch" class="input" placeholder="Пошук: Т-11"></div></div>' +
-    '<div id="gGroups" class="list"></div>';
-
-  const list = $('gGroups');
-  loader(list);
-  const paint = (groups, query) => {
-    const q = (query || '').trim().toUpperCase();
-    const shown = q ? groups.filter((g) => g.group_code.toUpperCase().includes(q)) : groups;
-    if (!shown.length) { empty(list, 'Немає груп за цим запитом'); return; }
-    list.innerHTML = shown.map((g) =>
-      '<button class="card grp-row' + (g.count ? '' : ' empty-row') + '" data-code="' + esc(g.group_code) + '">' +
-      '<span class="grp-code">' + esc(g.group_code) + '</span>' +
-      '<span class="muted small">' + (g.count ? g.count + ' студ.' : 'склад ще не зібрано') + '</span></button>').join('');
-    list.querySelectorAll('.grp-row').forEach((b) => {
-      b.onclick = () => { location.hash = '#/group/' + encodeURIComponent(b.dataset.code); };
-    });
-  };
-
-  groupApi('/api/roster').then((data) => {
-    const groups = (data.groups || []).slice();
-    group.data = groups;
-    paint(groups, '');
-    $('gSearch').oninput = () => paint(groups, $('gSearch').value);
-  }).catch((e) => {
-    clear(list);
-    list.innerHTML = '<div class="card"><div class="empty">' + esc(e.message || 'Список груп недоступний') + '</div></div>';
-  });
-}
-
-function studentName(s) {
-  return (s.last_name || '') + ' ' + (s.first_name || '');
-}
-
-function avgCell(value) {
-  if (value == null) return '<td class="num muted">—</td>';
-  const v = Math.round(value * 10) / 10;
-  const cls = v >= 9 ? 'top' : v >= 7 ? 'mid' : v >= 6 ? 'low' : 'bad';
-  return '<td class="num ' + cls + '">' + v + '</td>';
-}
-
-function drawGroupPage(el, code, roster, journal) {
-  const subjects = (journal && journal.subjects) || [];
-  const students = (journal && journal.students) || roster;
-  const legend = subjects.map((s, i) => (i + 1) + '. ' + s.name + (s.teacher ? ' — ' + s.teacher : ''));
-  const failed = (journal && journal.failed_students) || 0;
-  const warn = failed
-    ? 'Не вдалося завантажити журнал ' + failed + ' студ. — усереднені дані неповні.'
-    : '';
-
-  const head = '<div class="card">' +
-    '<div class="section-title" style="margin-top:0">Група ' + esc(code) + '</div>' +
-    '<div class="muted small">Студентів у базі: ' + roster.length +
-    (journal && journal.group_average != null ? ' · середній бал групи: ' + journal.group_average : '') +
-    (journal ? ' · оновлено ' + new Date(journal.updated_at).toLocaleString('uk-UA') : '') +
-    '</div>' +
-    '<div class="muted small grp-warn">' + esc(warn) + '</div></div>';
-
-  if (!subjects.length) {
-    const why = journal && journal.journal_error
-      ? journal.journal_error
-      : (journal ? 'Журнал групи поки порожній' : 'Завантаження журналу…');
-    el.innerHTML = head + '<div class="card"><div class="empty">' + esc(why) + '</div></div>' + studentListHtml(roster);
-    bindStudents(el);
-    return;
-  }
-
-  const rows = students.map((s) => {
-    const marks = s.marks || {};
-    const cells = subjects.map((sub) => avgCell(marks[sub.id])).join('');
-    const who = studentName(s);
-    return '<tr data-student="' + esc(who) + '" data-group="' + esc(code) + '">' +
-      '<td class="who">' + esc(who) + '</td>' + avgCell(s.average) + cells + '</tr>';
-  }).join('');
-
-  const header = subjects.map((sub, i) =>
-    '<th class="num" title="' + esc(sub.name + (sub.teacher ? ' — ' + sub.teacher : '')) + '">' + (i + 1) + '</th>').join('');
-
-  const discAvg = (journal && journal.discipline_average) || {};
-  const footer = '<tfoot><tr><td class="who">Середній по групі</td>' +
-    avgCell(journal ? journal.group_average : null) +
-    subjects.map((sub) => avgCell(discAvg[sub.id])).join('') + '</tr></tfoot>';
-
-  el.innerHTML = head +
-    '<div class="card table-card"><div class="table-scroll">' +
-    '<table class="gtable"><thead><tr><th class="who">Студент</th><th class="num">Сер.</th>' + header + '</tr></thead>' +
-    '<tbody>' + rows + '</tbody>' + footer + '</table></div>' +
-    '<div class="muted small" style="margin-top:10px">Номери колонок — предмети:</div>' +
-    '<ol class="legend">' + legend.map((t) => '<li>' + esc(t) + '</li>').join('') + '</ol></div>' +
-    studentListHtml(roster);
-
-  bindStudents(el);
-}
-
-function studentListHtml(roster) {
-  return '<div class="section-title">Склад групи</div>' +
-    '<div class="list">' + roster.map((s) =>
-      '<div class="card grp-row"><span class="grp-code">' + esc(studentName(s)) + '</span></div>').join('') + '</div>';
-}
-
-function bindStudents(el) {
-  el.querySelectorAll('[data-student]').forEach((row) => {
-    row.onclick = () => {
-      const [last, first] = row.dataset.student.split(' ');
-      localStorage.setItem(LS.group, row.dataset.group);
-      localStorage.setItem(LS.lastName, last || '');
-      localStorage.setItem(LS.firstName, first || '');
-      location.hash = '#/journal';
-    };
-  });
-}
-
-async function renderGroup() {
-  const el = $('groupList');
-  if (!el) return;
-  const hash = location.hash.replace('#/', '');
-  const code = decodeURIComponent(hash.split('/')[1] || '').trim().toUpperCase();
-  group.code = code;
-  if (!code) { drawGroupHome(el); return; }
-  loader(el);
-  try {
-    const rosterData = await groupApi('/api/roster/' + encodeURIComponent(code));
-    const roster = rosterData.students || [];
-    if (!roster.length) {
-      clear(el);
-      el.innerHTML = '<div class="card"><div class="empty">Для групи ' + esc(code) + ' ще немає списку студентів</div>' +
-        '<div class="muted small">Склад збирається з PDF коледжу й наказів про зарахування. ' +
-        'Першокурсників випускають у вересні — їхні групи набираються першими.</div>' +
-        '<button class="btn tonal block" id="gBack">До списку груп</button></div>';
-      $('gBack').onclick = () => { location.hash = '#/group'; };
-      return;
-    }
-    drawGroupPage(el, code, roster, null);
-    try {
-      const journal = await groupApi('/api/roster/' + encodeURIComponent(code) + '/journal');
-      group.data = journal;
-      drawGroupPage(el, code, roster, journal);
-    } catch (e) {
-      const box = el.querySelector('.grp-warn');
-      if (box) box.textContent = 'Журнал групи не завантажився: ' + (e.message || '');
-    }
-  } catch (e) {
-    clear(el);
-    el.innerHTML = '<div class="card"><div class="empty">' + esc(e.message || 'Не вдалося відкрити групу') + '</div>' +
-      '<button class="btn tonal block" id="gBack">До списку груп</button></div>';
-    $('gBack').onclick = () => { location.hash = '#/group'; };
-  }
 }
 
 async function route() {
   const hash = location.hash || '#/schedule';
   const name = hash.replace('#/', '').split('/')[0] || 'schedule';
-  setView(['schedule', 'journal', 'group', 'news', 'more'].includes(name) ? name : 'schedule');
+  setView(['schedule', 'journal', 'news', 'more'].includes(name) ? name : 'schedule');
   if (name === 'schedule') renderSchedule();
   else if (name === 'journal') renderJournal();
-  else if (name === 'group') renderGroup();
   else if (name === 'news') renderNews();
   else if (name === 'more') renderMore();
 }
