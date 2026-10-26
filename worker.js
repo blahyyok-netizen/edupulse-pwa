@@ -16,8 +16,10 @@ const GOOGLE_CLIENT_ID = '510124052044-i8hhrh7s4ijmfn0jstm2hktghp94pvup.apps.goo
 const FIREBASE_API_KEY = 'AIzaSyD2QDru_xQHFAZ1rad97jnUi-DEcnTR0Rw';
 const WORKSPACE_DOMAIN = 'sclnau.com.ua';
 
-// Той самий ключ, що вбудований у мобільний додаток коледжу, тобто публічний за своєю природою.
-// Щоб не тримати його в репозиторії, задайте JOURNAL_API_TOKEN (wrangler secret) — він має пріоритет.
+// Ключ Journal API. Публічний за своєю природою: той самий, що вбудований у мобільний
+// додаток коледжу, і доступний кожному, хто встановив застосунок.
+// Тому лежить у відкритому коді — це не витік. Якщо все ж захочеш сховати його,
+// задайте JOURNAL_API_TOKEN (wrangler secret): він матиме пріоритет.
 const PUBLIC_JOURNAL_TOKEN = 'Wx8zMVFSWqDbCwYrEhX66rYCtThPeuxHPC11SzY6Q0BDcdRycm5ta6KFrV7WcsAJ';
 
 // Публічні шляхи кабінету коледжу, які проксіюються з Bearer-токеном користувача.
