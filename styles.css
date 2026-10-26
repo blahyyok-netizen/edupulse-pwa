@@ -87,16 +87,30 @@ body {
 .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
 .btn:disabled { opacity: .5; cursor: default; }
 .btn.small-btn { width: auto; padding: 7px 12px; font-size: 13px; border-radius: 10px; }
-textarea.input { min-height: 84px; resize: vertical; }
-.check { display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--muted); margin-top: 10px; }
-.check input { width: 18px; height: 18px; accent-color: var(--primary); }
 
-.member-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; }
-.member-row.mine { border-color: var(--primary); }
-.member-name { flex: 1; font-weight: 600; font-size: 14.5px; }
-.tag.admin { background: var(--primary-container); color: var(--primary); }
-.post-head { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
-.post-body { font-size: 14.5px; white-space: pre-wrap; }
+.grp-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }
+.grp-row:active { transform: scale(.99); }
+.grp-code { font-weight: 650; font-size: 15px; }
+.grp-warn:empty { display: none; }
+.grp-warn { color: var(--amber); margin-top: 6px; }
+
+.table-card { padding: 12px; }
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.gtable { border-collapse: collapse; font-size: 13px; width: max-content; min-width: 100%; }
+.gtable th, .gtable td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.gtable thead th { position: sticky; top: 0; background: var(--card); color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.gtable td.who, .gtable th.who { position: sticky; left: 0; background: var(--card); font-weight: 600; }
+.gtable td.num, .gtable th.num { text-align: center; }
+.gtable tbody tr { cursor: pointer; }
+.gtable tbody tr:active td { background: var(--surface-variant); }
+.gtable tfoot td { border-top: 2px solid var(--border); border-bottom: none; font-weight: 700; }
+.gtable tfoot td.who { background: var(--card); }
+.num.top { color: var(--green); font-weight: 700; }
+.num.mid { color: var(--primary); font-weight: 700; }
+.num.low { color: var(--amber); }
+.num.bad { color: var(--red); font-weight: 700; }
+.legend { margin: 8px 0 0 18px; color: var(--muted); font-size: 12.5px; }
+.legend li { margin-bottom: 3px; }
 
 .dates { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 12px; scrollbar-width: none; }
 .dates::-webkit-scrollbar { display: none; }

@@ -7,7 +7,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "node test/webpush.test.mjs",
-    "test:e2e": "node test/push.e2e.mjs && node test/groups.e2e.mjs",
+    "test:e2e": "node test/push.e2e.mjs && node test/roster.e2e.mjs",
     "vapid:gen": "node scripts/gen-vapid-keys.mjs"
   },
   "devDependencies": {

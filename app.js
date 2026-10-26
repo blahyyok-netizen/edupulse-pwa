@@ -5,9 +5,6 @@ const LS = {
   mode: 'ep_mode', teacher: 'ep_teacher',
   lastName: 'ep_lastname', firstName: 'ep_firstname',
   pushCreds: 'ep_push_creds',
-  groupCode: 'ep_group_code',
-  groupAdmin: (code) => 'ep_group_admin_' + code,
-  groupMe: (code) => 'ep_group_me_' + code,
   sched: (k, d) => 'ep_sched_' + k + '_' + d,
   journal: (k) => 'ep_journal_' + k,
 };
@@ -881,213 +878,133 @@ function renderMore() {
   renderPayments();
 }
 
-// --- Портал групи ---
-// Список студентів не скрейпиться: кожен реєструється сам, а журнал API
-// підтверджує, що пара «група + ПІБ» справжня. Тому база містить лише тих,
-// хто сам прийшов.
+// --- Електронний журнал групи ---
+// Склад груп не самореєстрація: список збирається з PDF рейтингу коледжу,
+// а кожне ПІБ підтверджується журнальним API. Тому журнал групи показує
+// справжніх студентів, а не тих, хто просто вписався.
 
 const group = { code: '', data: null };
 
-function groupAdminToken(code) {
-  return localStorage.getItem(LS.groupAdmin(code)) || '';
-}
-
-function groupMe(code) {
-  return readJson(LS.groupMe(code), null);
-}
-
-async function groupApi(path, opts = {}) {
-  const headers = { 'content-type': 'application/json' };
-  const token = groupAdminToken(group.code);
-  if (token) headers.authorization = 'Bearer ' + token;
-  const res = await fetch(path, {
-    method: opts.method || 'GET',
-    headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+async function groupApi(path) {
+  const res = await fetch(path);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
 
 function drawGroupHome(el) {
-  const saved = localStorage.getItem(LS.groupCode) || '';
   el.innerHTML =
-    '<div class="card"><div class="section-title" style="margin-top:0">Портал групи</div>' +
-    '<div class="muted small">Список студентів збирається не скрейпінгом: кожен реєструється сам, а журнал коледжу підтверджує, що ви в цій групі. Тому тут немає чужих ПІБ — лише ті, хто прийшов.</div>' +
-    '<div class="row" style="margin-top:14px"><input id="gCode" class="input" placeholder="Код групи, напр. Т-11" value="' + esc(saved) + '"></div>' +
-    '<button id="gOpen" class="btn block">Відкрити групу</button></div>' +
-    '<div class="card"><div class="section-title" style="margin-top:0">Створити групу</div>' +
-    '<div class="muted small">Створити може лише студент цієї групи: сервер перевірить ваше ПІБ у журналі. Той, хто створив, стає адміном.</div>' +
-    '<div class="row" style="margin-top:12px"><input id="gNewCode" class="input" placeholder="Код групи, напр. Т-11"></div>' +
-    '<div class="row"><input id="gNewName" class="input" placeholder="Назва групи (необов\'язково)"></div>' +
-    '<div class="row"><input id="gLast" class="input" placeholder="Прізвище" value="' + esc(localStorage.getItem(LS.lastName) || '') + '">' +
-    '<input id="gFirst" class="input" placeholder="Ім\'я" value="' + esc(localStorage.getItem(LS.firstName) || '') + '"></div>' +
-    '<div class="row"><input id="gPass" class="input" type="password" placeholder="Пароль адміна"></div>' +
-    '<button id="gCreate" class="btn tonal block">Створити групу</button></div>';
+    '<div class="card"><div class="section-title" style="margin-top:0">Журнал групи</div>' +
+    '<div class="muted small">Оберіть групу — побачите електронний журнал усіх її студентів: середні оцінки за предметами та підсумковий бал.</div>' +
+    '<div class="row" style="margin-top:12px"><input id="gSearch" class="input" placeholder="Пошук: Т-11"></div></div>' +
+    '<div id="gGroups" class="list"></div>';
 
-  $('gOpen').onclick = () => {
-    const code = $('gCode').value.trim().toUpperCase();
-    if (!code) return;
-    localStorage.setItem(LS.groupCode, code);
-    location.hash = '#/group/' + encodeURIComponent(code);
+  const list = $('gGroups');
+  loader(list);
+  const paint = (groups, query) => {
+    const q = (query || '').trim().toUpperCase();
+    const shown = q ? groups.filter((g) => g.group_code.toUpperCase().includes(q)) : groups;
+    if (!shown.length) { empty(list, 'Немає груп за цим запитом'); return; }
+    list.innerHTML = shown.map((g) =>
+      '<button class="card grp-row" data-code="' + esc(g.group_code) + '">' +
+      '<span class="grp-code">' + esc(g.group_code) + '</span>' +
+      '<span class="muted small">' + g.count + ' студ.</span></button>').join('');
+    list.querySelectorAll('.grp-row').forEach((b) => {
+      b.onclick = () => { location.hash = '#/group/' + encodeURIComponent(b.dataset.code); };
+    });
   };
-  $('gCreate').onclick = async () => {
-    const btn = $('gCreate');
-    btn.disabled = true;
-    try {
-      const data = await groupApi('/api/groups', {
-        method: 'POST',
-        body: {
-          code: $('gNewCode').value.trim(),
-          name: $('gNewName').value.trim(),
-          lastName: $('gLast').value.trim(),
-          firstName: $('gFirst').value.trim(),
-          password: $('gPass').value,
-        },
-      });
-      localStorage.setItem(LS.groupCode, data.group.code);
-      if (data.token) localStorage.setItem(LS.groupAdmin(data.group.code), data.token);
-      toast('Групу створено');
-      location.hash = '#/group/' + encodeURIComponent(data.group.code);
-    } catch (e) {
-      toast(e.message || 'Не вдалося створити групу', 'err');
-      btn.disabled = false;
-    }
-  };
+
+  groupApi('/api/roster').then((data) => {
+    const groups = (data.groups || []).slice();
+    group.data = groups;
+    paint(groups, '');
+    $('gSearch').oninput = () => paint(groups, $('gSearch').value);
+  }).catch((e) => {
+    clear(list);
+    list.innerHTML = '<div class="card"><div class="empty">' + esc(e.message || 'Список груп недоступний') + '</div></div>';
+  });
 }
 
-function memberName(m) {
-  return (m.last_name || '') + ' ' + (m.first_name || '');
+function studentName(s) {
+  return (s.last_name || '') + ' ' + (s.first_name || '');
 }
 
-function drawGroupPage(el, data) {
-  const code = data.group.code;
-  const me = groupMe(code);
-  const isAdmin = !!groupAdminToken(code);
-  const members = data.members || [];
-  const announcements = data.announcements || [];
+function avgCell(value) {
+  if (value == null) return '<td class="num muted">—</td>';
+  const v = Math.round(value * 10) / 10;
+  const cls = v >= 9 ? 'top' : v >= 7 ? 'mid' : v >= 6 ? 'low' : 'bad';
+  return '<td class="num ' + cls + '">' + v + '</td>';
+}
 
-  const myMember = me ? members.find((m) => m.last_name === me.lastName && m.first_name === me.firstName) : null;
+function drawGroupPage(el, code, roster, journal) {
+  const subjects = (journal && journal.subjects) || [];
+  const students = (journal && journal.students) || roster;
+  const legend = subjects.map((s, i) => (i + 1) + '. ' + s.name + (s.teacher ? ' — ' + s.teacher : ''));
+  const failed = (journal && journal.failed_students) || 0;
+  const warn = failed
+    ? 'Не вдалося завантажити журнал ' + failed + ' студ. — усереднені дані неповні.'
+    : '';
 
-  const roster = members.map((m) => {
-    const mine = myMember && m.id === myMember.id;
-    return '<div class="card member-row' + (mine ? ' mine' : '') + '">' +
-      '<div class="member-name">' + esc(memberName(m)) + (m.role === 'admin' ? ' <span class="tag admin">адмін</span>' : '') + '</div>' +
-      (mine ? '<button class="btn tonal small-btn" id="gMyJournal">Мій журнал</button>' : '') +
-      (isAdmin ? '<button class="btn ghost small-btn g-del" data-id="' + m.id + '">Прибрати</button>' : '') +
-      '</div>';
+  const head = '<div class="card">' +
+    '<div class="section-title" style="margin-top:0">Група ' + esc(code) + '</div>' +
+    '<div class="muted small">Студентів у базі: ' + roster.length +
+    (journal && journal.group_average != null ? ' · середній бал групи: ' + journal.group_average : '') +
+    (journal ? ' · оновлено ' + new Date(journal.updated_at).toLocaleString('uk-UA') : '') +
+    '</div>' +
+    '<div class="muted small grp-warn">' + esc(warn) + '</div></div>';
+
+  if (!subjects.length) {
+    const why = journal && journal.journal_error
+      ? journal.journal_error
+      : (journal ? 'Журнал групи поки порожній' : 'Завантаження журналу…');
+    el.innerHTML = head + '<div class="card"><div class="empty">' + esc(why) + '</div></div>' + studentListHtml(roster);
+    bindStudents(el);
+    return;
+  }
+
+  const rows = students.map((s) => {
+    const marks = s.marks || {};
+    const cells = subjects.map((sub) => avgCell(marks[sub.id])).join('');
+    const who = studentName(s);
+    return '<tr data-student="' + esc(who) + '" data-group="' + esc(code) + '">' +
+      '<td class="who">' + esc(who) + '</td>' + avgCell(s.average) + cells + '</tr>';
   }).join('');
 
-  const posts = announcements.length
-    ? announcements.map((a) =>
-        '<div class="card post"><div class="post-head">' + esc(a.author || 'Адмін') + ' · ' + esc(new Date(a.created_at).toLocaleString('uk-UA')) + '</div>' +
-        '<div class="post-body">' + esc(a.body) + '</div></div>').join('')
-    : '<div class="empty">Об\'явлень ще немає</div>';
+  const header = subjects.map((sub, i) =>
+    '<th class="num" title="' + esc(sub.name + (sub.teacher ? ' — ' + sub.teacher : '')) + '">' + (i + 1) + '</th>').join('');
 
-  el.innerHTML =
-    '<div class="card"><div class="section-title" style="margin-top:0">' + esc(data.group.name || code) + '</div>' +
-    '<div class="muted small">Код групи: <b>' + esc(code) + '</b> · студентів у списку: ' + members.length + '</div>' +
-    (myMember
-      ? '<div class="row" style="margin-top:12px;margin-bottom:0"><button class="btn block" id="gMyJournal2">Відкрити мій журнал</button></div>'
-      : '<div class="row" style="margin-top:12px"><input id="gJoinLast" class="input" placeholder="Ваше прізвище" value="' + esc((me && me.lastName) || localStorage.getItem(LS.lastName) || '') + '">' +
-        '<input id="gJoinFirst" class="input" placeholder="Ваше ім\'я" value="' + esc((me && me.firstName) || localStorage.getItem(LS.firstName) || '') + '"></div>' +
-        '<div class="row" style="margin-bottom:0"><button id="gJoin" class="btn block">Додати мене до списку</button></div>') +
-    '</div>' +
+  const discAvg = (journal && journal.discipline_average) || {};
+  const footer = '<tfoot><tr><td class="who">Середній по групі</td>' +
+    avgCell(journal ? journal.group_average : null) +
+    subjects.map((sub) => avgCell(discAvg[sub.id])).join('') + '</tr></tfoot>';
 
-    '<div class="section-title">Список групи</div>' +
-    (members.length ? roster : '<div class="empty">Список порожній — заходьте першим</div>') +
+  el.innerHTML = head +
+    '<div class="card table-card"><div class="table-scroll">' +
+    '<table class="gtable"><thead><tr><th class="who">Студент</th><th class="num">Сер.</th>' + header + '</tr></thead>' +
+    '<tbody>' + rows + '</tbody>' + footer + '</table></div>' +
+    '<div class="muted small" style="margin-top:10px">Номери колонок — предмети:</div>' +
+    '<ol class="legend">' + legend.map((t) => '<li>' + esc(t) + '</li>').join('') + '</ol></div>' +
+    studentListHtml(roster);
 
-    '<div class="section-title">Об\'явлення</div>' +
-    posts +
+  bindStudents(el);
+}
 
-    '<div class="section-title">Адмін</div>' +
-    (isAdmin
-      ? '<div class="card"><textarea id="gPost" class="input" rows="3" placeholder="Текст об\'явлення для групи"></textarea>' +
-        '<label class="check"><input type="checkbox" id="gPush"> Надіслати push підписникам групи</label>' +
-        '<button id="gSend" class="btn block" style="margin-top:10px">Опублікувати</button></div>'
-      : '<div class="card"><div class="muted small">Пароль адміна групи — щоб публікувати об\'явлення й керувати списком.</div>' +
-        '<button id="gAdminLogin" class="btn tonal block" style="margin-top:10px">Вхід для адміна</button>' +
-        '<div id="gAdminBox" style="display:none;margin-top:10px"><div class="row"><input id="gAdminPass" class="input" type="password" placeholder="Пароль"></div>' +
-        '<button id="gAdminGo" class="btn block">Увійти</button></div></div>');
+function studentListHtml(roster) {
+  return '<div class="section-title">Склад групи</div>' +
+    '<div class="list">' + roster.map((s) =>
+      '<div class="card grp-row"><span class="grp-code">' + esc(studentName(s)) + '</span></div>').join('') + '</div>';
+}
 
-  const openJournal = () => {
-    if (!myMember) return;
-    localStorage.setItem(LS.group, code);
-    localStorage.setItem(LS.lastName, myMember.last_name);
-    localStorage.setItem(LS.firstName, myMember.first_name);
-    location.hash = '#/journal';
-  };
-  if ($('gMyJournal')) $('gMyJournal').onclick = openJournal;
-  if ($('gMyJournal2')) $('gMyJournal2').onclick = openJournal;
-
-  const join = $('gJoin');
-  if (join) join.onclick = async () => {
-    join.disabled = true;
-    try {
-      await groupApi('/api/groups/' + encodeURIComponent(code) + '/join', {
-        method: 'POST',
-        body: { lastName: $('gJoinLast').value.trim(), firstName: $('gJoinFirst').value.trim() },
-      });
-      localStorage.setItem(LS.groupMe(code), JSON.stringify({ lastName: $('gJoinLast').value.trim(), firstName: $('gJoinFirst').value.trim() }));
-      toast('Ви в списку групи');
-      renderGroup();
-    } catch (e) {
-      toast(e.message || 'Не вдалося додати', 'err');
-      join.disabled = false;
-    }
-  };
-
-  el.querySelectorAll('.g-del').forEach((b) => b.onclick = async () => {
-    try {
-      await groupApi('/api/groups/' + encodeURIComponent(code) + '/admin/members/' + b.dataset.id, { method: 'DELETE' });
-      toast('Студента прибрано');
-      renderGroup();
-    } catch (e) {
-      toast(e.message || 'Не вдалося прибрати', 'err');
-    }
+function bindStudents(el) {
+  el.querySelectorAll('[data-student]').forEach((row) => {
+    row.onclick = () => {
+      const [last, first] = row.dataset.student.split(' ');
+      localStorage.setItem(LS.group, row.dataset.group);
+      localStorage.setItem(LS.lastName, last || '');
+      localStorage.setItem(LS.firstName, first || '');
+      location.hash = '#/journal';
+    };
   });
-
-  const login = $('gAdminLogin');
-  if (login) login.onclick = () => {
-    $('gAdminBox').style.display = '';
-    login.style.display = 'none';
-    $('gAdminPass').focus();
-  };
-  const go = $('gAdminGo');
-  if (go) go.onclick = async () => {
-    go.disabled = true;
-    try {
-      const data = await groupApi('/api/groups/' + encodeURIComponent(code) + '/admin/login', {
-        method: 'POST',
-        body: { password: $('gAdminPass').value },
-      });
-      localStorage.setItem(LS.groupAdmin(code), data.token);
-      toast('Виконано вхід');
-      renderGroup();
-    } catch (e) {
-      toast(e.message || 'Невірний пароль', 'err');
-      go.disabled = false;
-    }
-  };
-
-  const send = $('gSend');
-  if (send) send.onclick = async () => {
-    const text = $('gPost').value.trim();
-    if (!text) return;
-    send.disabled = true;
-    try {
-      const data = await groupApi('/api/groups/' + encodeURIComponent(code) + '/admin/announcements', {
-        method: 'POST',
-        body: { body: text, push: $('gPush').checked },
-      });
-      toast(data.pushed ? 'Опубліковано, push: ' + data.pushed : 'Опубліковано');
-      renderGroup();
-    } catch (e) {
-      toast(e.message || 'Не вдалося опублікувати', 'err');
-      send.disabled = false;
-    }
-  };
 }
 
 async function renderGroup() {
@@ -1099,13 +1016,28 @@ async function renderGroup() {
   if (!code) { drawGroupHome(el); return; }
   loader(el);
   try {
-    const data = await groupApi('/api/groups/' + encodeURIComponent(code));
-    group.data = data;
-    drawGroupPage(el, data);
+    const rosterData = await groupApi('/api/roster/' + encodeURIComponent(code));
+    const roster = rosterData.students || [];
+    if (!roster.length) {
+      clear(el);
+      el.innerHTML = '<div class="card"><div class="empty">Для групи ' + esc(code) + ' ще немає списку студентів</div>' +
+        '<button class="btn tonal block" id="gBack">До списку груп</button></div>';
+      $('gBack').onclick = () => { location.hash = '#/group'; };
+      return;
+    }
+    drawGroupPage(el, code, roster, null);
+    try {
+      const journal = await groupApi('/api/roster/' + encodeURIComponent(code) + '/journal');
+      group.data = journal;
+      drawGroupPage(el, code, roster, journal);
+    } catch (e) {
+      const box = el.querySelector('.grp-warn');
+      if (box) box.textContent = 'Журнал групи не завантажився: ' + (e.message || '');
+    }
   } catch (e) {
     clear(el);
     el.innerHTML = '<div class="card"><div class="empty">' + esc(e.message || 'Не вдалося відкрити групу') + '</div>' +
-      '<button class="btn tonal block" id="gBack">Інша група</button></div>';
+      '<button class="btn tonal block" id="gBack">До списку груп</button></div>';
     $('gBack').onclick = () => { location.hash = '#/group'; };
   }
 }

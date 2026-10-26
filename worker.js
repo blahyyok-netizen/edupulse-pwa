@@ -6,7 +6,7 @@ import swJs from './sw.js';
 import icon192 from './icon-192.png';
 import icon512 from './icon-512.png';
 import appleIcon from './apple-touch-icon.png';
-import { encryptPush, generateEcdhKeyPair, signVapidJwt, b64uDecode, b64uEncode } from './webpush.mjs';
+import { encryptPush, generateEcdhKeyPair, signVapidJwt, b64uDecode } from './webpush.mjs';
 
 const TT = 'https://tt.sclnau.com.ua';
 const TT_API = 'https://tt-api.sclnau.com.ua';
@@ -327,289 +327,192 @@ async function checkSubscription(env, sub, keyPair, journal) {
   return { dead: false, changed, notify: changes.length > 0 };
 }
 
-// --- Портал на групу ---
-// Список студентів не збирається скрейпінгом: студент сам реєструється
-// (група + ПІБ), а журнал API підтверджує, що ця пара реальна. Тому в базі
-// лежать тільки ПІБ тих, хто сам прийшов.
+// --- Ростер і журнал групи ---
+// Склад груп — не само registrations: список збирається з PDF «Рейтинг успішності
+// студентів» коледжу, а кожне ПІБ перевіряється журнальним API (200 лише для
+// справжньої пари «група + прізвище + ім'я»). Готовий ростер лежить у D1.
 
-const GROUP_CODE_RE = /^[0-9A-ZА-ЯІЇЄҐ][0-9A-ZА-ЯІЇЄҐ\-]{1,15}$/;
-const GROUP_TOKEN_TTL = 30 * 24 * 3600 * 1000;
-const GROUP_ANNOUNCE_LIMIT = 50;
+const GROUP_JOURNAL_PREFIX = 'gj:';
+const GROUP_JOURNAL_TTL = 6 * 3600 * 1000;
+const GROUP_FETCH_CONC = 6;
 
-function normalizeCode(code) {
+function normalizeGroupCode(code) {
   return String(code || '').trim().toUpperCase().replace(/\s+/g, '');
 }
 
-async function hmacBytes(secret, data) {
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
-  return new Uint8Array(await crypto.subtle.sign('HMAC', key, bytes));
+// Чисельна оцінка. «нб» (не був) та інші нечислові позначення не враховуються.
+// Порожня оцінка — це відсутність оцінки, а не нуль: Number('') дав би 0 і
+// «розтягнуло» б середній бал усіх неоцінених занять.
+function markValue(raw) {
+  if (raw == null) return null;
+  const text = String(raw).trim().replace(',', '.');
+  if (!text) return null;
+  const num = Number(text);
+  return Number.isFinite(num) ? num : null;
 }
 
-function sameBytes(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
+// Журнал зберігає історію, тож беремо лише поточний навчальний рік.
+// Рік у коледжі починається 1 вересня: якщо найновіша дата ще до вересня,
+// то це завершений рік і поточним вважаємо попередній.
+function academicCutoff(latest) {
+  if (!latest) return new Date().getFullYear() + '-09-01';
+  let year = Number(latest.slice(0, 4));
+  if (Number(latest.slice(5, 7)) < 9) year--;
+  return year + '-09-01';
 }
 
-async function signToken(payload, secret) {
-  const body = b64uEncode(new TextEncoder().encode(JSON.stringify(payload)));
-  return body + '.' + b64uEncode(await hmacBytes(secret, body));
-}
-
-async function readToken(token, secret) {
-  if (!token || !secret) return null;
-  const parts = String(token).split('.');
-  if (parts.length !== 2) return null;
-  if (!sameBytes(b64uDecode(parts[1]), await hmacBytes(secret, parts[0]))) return null;
-  try {
-    const payload = JSON.parse(new TextDecoder().decode(b64uDecode(parts[0])));
-    if (!payload || !payload.e || payload.e < Date.now()) return null;
-    return payload;
-  } catch (e) {
-    return null;
+function summarizeJournal(data, since) {
+  const subjects = new Map();
+  const byDiscipline = new Map();
+  const all = [];
+  for (const d of (data && data.journal) || []) {
+    const id = d.discipline_id;
+    if (!subjects.has(id)) subjects.set(id, { id, name: d.discipline || 'Предмет', teacher: d.teacher || '' });
+    for (const s of d.sessions || []) {
+      if (since && (s.date || '') < since) continue;
+      for (const e of s.entries || []) {
+        const value = markValue(e.mark && e.mark.value);
+        if (value == null) continue;
+        const item = { id, value, date: s.date || '' };
+        all.push(item);
+        if (!byDiscipline.has(id)) byDiscipline.set(id, []);
+        byDiscipline.get(id).push(item);
+      }
+    }
   }
+  const avg = (arr) => (arr.length ? Math.round((arr.reduce((n, x) => n + x.value, 0) / arr.length) * 100) / 100 : null);
+  const marks = {};
+  for (const [id, arr] of byDiscipline) marks[id] = avg(arr);
+  return {
+    subjects: [...subjects.values()],
+    marks,
+    average: avg(all),
+    count: all.length,
+  };
 }
 
-async function passwordHash(password, saltB64) {
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: b64uDecode(saltB64), iterations: 100000, hash: 'SHA-256' }, key, 256
-  );
-  return b64uEncode(new Uint8Array(bits));
-}
-
-async function makePasswordHash(password) {
-  const salt = b64uEncode(crypto.getRandomValues(new Uint8Array(16)));
-  return salt + ':' + await passwordHash(password, salt);
-}
-
-async function checkPassword(password, stored) {
-  const parts = String(stored || '').split(':');
-  if (parts.length !== 2) return false;
-  return sameBytes(b64uDecode(await passwordHash(password, parts[0])), b64uDecode(parts[1]));
-}
-
-// Перевірка студента: журнал API відповідає 200 лише для справжньої пари
-// «група + прізвище + ім'я» (для чужої групи або неіснуючого — 404).
-async function checkStudent(env, group, lastName, firstName) {
+async function fetchGroupJournals(env, code, students) {
   const token = (env && env.JOURNAL_API_TOKEN) || PUBLIC_JOURNAL_TOKEN;
-  const q = new URLSearchParams({ group, last_name: lastName, first_name: firstName });
-  try {
-    const res = await fetch(journalApiBase(env) + '/journal/?' + q.toString(), {
-      headers: { 'X-Auth-Token': token, 'user-agent': 'okhttp/4.12.0' },
+  const raw = [];
+  let failed = 0;
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(GROUP_FETCH_CONC, students.length) }, async () => {
+    while (cursor < students.length) {
+      const s = students[cursor++];
+      const q = new URLSearchParams({ group: code, last_name: s.last_name, first_name: s.first_name });
+      try {
+        const res = await fetch(journalApiBase(env) + '/journal/?' + q.toString(), {
+          headers: { 'X-Auth-Token': token, 'user-agent': 'okhttp/4.12.0' },
+        });
+        if (!res.ok) { failed++; continue; }
+        raw.push({ student: s, data: await res.json() });
+      } catch (e) { failed++; }
+    }
+  }));
+
+  // Відкидаємо минулі навчальніроки — у журналі лишаються оцінки за попередні роки.
+  let latest = '';
+  for (const r of raw) {
+    for (const d of (r.data && r.data.journal) || []) {
+      for (const s of d.sessions || []) if ((s.date || '') > latest) latest = s.date || '';
+    }
+  }
+  const since = academicCutoff(latest);
+
+  const subjects = new Map();
+  const rows = [];
+  for (const r of raw) {
+    const summary = summarizeJournal(r.data, since);
+    for (const sub of summary.subjects) if (!subjects.has(sub.id)) subjects.set(sub.id, sub);
+    rows.push({
+      student_id: r.student.student_id,
+      last_name: r.student.last_name,
+      first_name: r.student.first_name,
+      average: summary.average,
+      count: summary.count,
+      marks: summary.marks,
     });
-    if (res.status === 404) return { ok: false, reason: 'not_found' };
-    if (!res.ok) return { ok: false, reason: 'error' };
-    const data = await res.json();
-    if (!data || !data.student_id) return { ok: false, reason: 'not_found' };
-    return { ok: true, data };
-  } catch (e) {
-    return { ok: false, reason: 'error' };
   }
+  return { rows, subjects: [...subjects.values()], since, failed };
 }
 
-async function readJsonBody(request) {
-  try {
-    return await request.json();
-  } catch (e) {
-    return null;
+async function groupJournal(env, db, code) {
+  const key = GROUP_JOURNAL_PREFIX + code;
+  if (env.PUSH_SUBS) {
+    try {
+      const raw = await env.PUSH_SUBS.get(key);
+      if (raw) {
+        const cached = JSON.parse(raw);
+        if (Date.now() - cached.updated_at < GROUP_JOURNAL_TTL) {
+          cached.cached = true;
+          return cached;
+        }
+      }
+    } catch (e) { }
   }
-}
 
-async function findGroup(db, code) {
-  return db.prepare('SELECT id, code, name, admin_hash, created_at FROM groups WHERE code = ?').bind(code).first();
-}
-
-async function listMembers(db, groupId) {
   const res = await db.prepare(
-    'SELECT id, last_name, first_name, role, joined_at FROM members WHERE group_id = ? ORDER BY last_name, first_name'
-  ).bind(groupId).all();
-  return res.results || [];
-}
+    'SELECT student_id, last_name, first_name FROM group_students WHERE group_code = ? ORDER BY student_id'
+  ).bind(code).all();
+  const students = res.results || [];
+  const { rows, subjects, since, failed } = await fetchGroupJournals(env, code, students);
 
-async function listAnnouncements(db, groupId) {
-  const res = await db.prepare(
-    'SELECT id, author, body, created_at FROM announcements WHERE group_id = ? ORDER BY id DESC LIMIT ?'
-  ).bind(groupId, GROUP_ANNOUNCE_LIMIT).all();
-  return res.results || [];
-}
-
-async function requireAdmin(request, env, groupId) {
-  if (!env.AUTH_SECRET) return null;
-  const header = request.headers.get('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  const payload = await readToken(token, env.AUTH_SECRET);
-  if (!payload || payload.r !== 'admin' || payload.g !== groupId) return null;
+  const disciplineTotals = new Map();
+  for (const row of rows) {
+    for (const [id, value] of Object.entries(row.marks || {})) {
+      if (!disciplineTotals.has(id)) disciplineTotals.set(id, []);
+      disciplineTotals.get(id).push(value);
+    }
+  }
+  const disciplineAverage = {};
+  for (const [id, arr] of disciplineTotals) {
+    disciplineAverage[id] = Math.round((arr.reduce((n, x) => n + x, 0) / arr.length) * 100) / 100;
+  }
+  const all = rows.filter((r) => r.average != null).map((r) => r.average);
+  const payload = {
+    code,
+    updated_at: Date.now(),
+    academic_year_from: since,
+    subjects: subjects.sort((a, b) => (a.name || '').localeCompare(b.name || '')),
+    students: rows,
+    discipline_average: disciplineAverage,
+    group_average: all.length ? Math.round((all.reduce((n, x) => n + x, 0) / all.length) * 100) / 100 : null,
+    // Увесь журнал не прийшов — сервер коледжу не відповів або віддає помилку.
+    journal_error: failed > 0 && !rows.length ? 'Сервер журналу коледжу зараз недоступний' : null,
+    failed_students: failed || 0,
+  };
+  if (env.PUSH_SUBS && !payload.journal_error) {
+    try { await env.PUSH_SUBS.put(key, JSON.stringify(payload)); } catch (e) { }
+  }
   return payload;
 }
 
-// Сповіщення всім підписникам групи: журнал сберігається в KV разом із групою,
-// тож фільтр — це просто збіг коду групи.
-async function notifyGroup(env, code, title, body) {
-  if (!env.PUSH_SUBS) return 0;
-  let names = [];
-  try {
-    names = await listKvKeys(env.PUSH_SUBS, PUSH_PREFIX);
-  } catch (e) {
-    return 0;
-  }
-  if (!names.length) return 0;
-  const keyPair = await generateEcdhKeyPair();
-  let sent = 0;
-  for (const name of names) {
-    const raw = await env.PUSH_SUBS.get(name);
-    if (!raw) continue;
-    let sub = null;
-    try { sub = JSON.parse(raw); } catch (e) { continue; }
-    if (normalizeCode(sub.group) !== code) continue;
-    const res = await sendPush(env, sub, { title, body, url: '/#/group/' + encodeURIComponent(code), tag: 'group-' + code }, keyPair);
-    if (res.ok) sent++;
-    else if (res.status === 404 || res.status === 410) await env.PUSH_SUBS.delete(name);
-  }
-  return sent;
-}
-
-async function handleGroups(request, env, origin, url) {
-  if (!env.DB) return json({ error: 'Групи не налаштовані' }, 503);
+async function handleRoster(request, env, url) {
+  if (!env.DB) return json({ error: 'Ростер недоступний' }, 503);
   const db = env.DB;
-  const parts = url.pathname.split('/').filter(Boolean); // api / groups [...]
-  const method = request.method;
+  const rest = url.pathname.slice('/api/roster'.length).split('/').filter(Boolean);
+  const code = normalizeGroupCode(decodeURIComponent(rest[0] || ''));
 
-  // POST /api/groups — створити групу (тільки реальний студент цієї групи)
-  if (parts.length === 2 && method === 'POST') {
-    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-    const body = await readJsonBody(request);
-    if (!body) return json({ error: 'Bad request' }, 400);
-    const code = normalizeCode(body.code);
-    const name = String(body.name || '').trim() || code;
-    const password = String(body.password || '');
-    const lastName = String(body.lastName || '').trim();
-    const firstName = String(body.firstName || '').trim();
-    if (!GROUP_CODE_RE.test(code)) return json({ error: 'Код групи має вигляд Т-11' }, 400);
-    if (password.length < 4) return json({ error: 'Пароль адміна — щонайменше 4 символи' }, 400);
-    if (!lastName || !firstName) return json({ error: 'Вкажіть прізвище та ім\'я' }, 400);
-    if (await findGroup(db, code)) return json({ error: 'Така група вже існує' }, 409);
-
-    const check = await checkStudent(env, code, lastName, firstName);
-    if (!check.ok) {
-      return json(
-        { error: check.reason === 'not_found' ? 'Вас не знайдено в журналі групи ' + code : 'Не вдалося перевірити журнал' },
-        check.reason === 'not_found' ? 404 : 502
-      );
-    }
-
-    const now = Date.now();
-    await db.prepare('INSERT INTO groups (code, name, admin_hash, created_at) VALUES (?, ?, ?, ?)')
-      .bind(code, name, await makePasswordHash(password), now).run();
-    const group = await findGroup(db, code);
-    await db.prepare('INSERT OR IGNORE INTO members (group_id, last_name, first_name, role, joined_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(group.id, check.data.last_name, check.data.first_name, 'admin', now).run();
-
-    let token = null;
-    if (env.AUTH_SECRET) {
-      token = await signToken({ g: group.id, r: 'admin', e: Date.now() + GROUP_TOKEN_TTL }, env.AUTH_SECRET);
-    }
-    return json({ ok: true, group: { code: group.code, name: group.name }, token });
+  // GET /api/roster — групи, для яких є ростер
+  if (!code) {
+    const res = await db.prepare(
+      'SELECT group_code, COUNT(*) AS count FROM group_students GROUP BY group_code ORDER BY group_code'
+    ).all();
+    return json({ groups: res.results || [] });
   }
 
-  // GET /api/groups/:code — група, список, об'явлення
-  if (parts.length === 3 && method === 'GET') {
-    const group = await findGroup(db, normalizeCode(decodeURIComponent(parts[2])));
-    if (!group) return json({ error: 'Групу не знайдено' }, 404);
-    return json({
-      ok: true,
-      group: { code: group.code, name: group.name },
-      members: await listMembers(db, group.id),
-      announcements: await listAnnouncements(db, group.id),
-    });
+  // GET /api/roster/:code — склад групи
+  if (rest.length === 1) {
+    const res = await db.prepare(
+      'SELECT student_id, last_name, first_name FROM group_students WHERE group_code = ? ORDER BY last_name, first_name'
+    ).bind(code).all();
+    return json({ code, students: res.results || [] });
   }
 
-  // POST /api/groups/:code/join — самозапис студента
-  if (parts.length === 4 && parts[3] === 'join' && method === 'POST') {
-    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-    const group = await findGroup(db, normalizeCode(decodeURIComponent(parts[2])));
-    if (!group) return json({ error: 'Групу не знайдено' }, 404);
-    const body = await readJsonBody(request);
-    if (!body) return json({ error: 'Bad request' }, 400);
-    const lastName = String(body.lastName || '').trim();
-    const firstName = String(body.firstName || '').trim();
-    if (!lastName || !firstName) return json({ error: 'Вкажіть прізвище та ім\'я' }, 400);
-
-    const check = await checkStudent(env, group.code, lastName, firstName);
-    if (!check.ok) {
-      return json(
-        { error: check.reason === 'not_found' ? 'Вас не знайдено в журналі групи ' + group.code : 'Не вдалося перевірити журнал' },
-        check.reason === 'not_found' ? 404 : 502
-      );
-    }
-    await db.prepare('INSERT OR IGNORE INTO members (group_id, last_name, first_name, role, joined_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(group.id, check.data.last_name, check.data.first_name, 'member', Date.now()).run();
-    return json({ ok: true, members: await listMembers(db, group.id) });
-  }
-
-  // POST /api/groups/:code/admin/login — вхід адміна
-  if (parts.length === 5 && parts[3] === 'admin' && parts[4] === 'login' && method === 'POST') {
-    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-    if (!env.AUTH_SECRET) return json({ error: 'Пароль адміна не налаштований' }, 503);
-    const group = await findGroup(db, normalizeCode(decodeURIComponent(parts[2])));
-    if (!group) return json({ error: 'Групу не знайдено' }, 404);
-    const body = await readJsonBody(request);
-    if (!body || !(await checkPassword(String(body.password || ''), group.admin_hash))) {
-      return json({ error: 'Невірний пароль' }, 401);
-    }
-    const token = await signToken({ g: group.id, r: 'admin', e: Date.now() + GROUP_TOKEN_TTL }, env.AUTH_SECRET);
-    return json({ ok: true, token });
-  }
-
-  const group = parts.length >= 3 ? await findGroup(db, normalizeCode(decodeURIComponent(parts[2]))) : null;
-  if (parts.length >= 4 && parts[3] === 'admin' && group) {
-    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-    if (!(await requireAdmin(request, env, group.id))) return json({ error: 'Немає прав адміна' }, 403);
-
-    // POST /api/groups/:code/admin/announcements — об'явлення
-    if (parts.length === 5 && parts[4] === 'announcements' && method === 'POST') {
-      const body = await readJsonBody(request);
-      if (!body) return json({ error: 'Bad request' }, 400);
-      const text = String(body.body || '').trim().slice(0, 1000);
-      if (!text) return json({ error: 'Порожнє об\'явлення' }, 400);
-      const now = Date.now();
-      await db.prepare('INSERT INTO announcements (group_id, author, body, created_at) VALUES (?, ?, ?, ?)')
-        .bind(group.id, 'Адмін', text, now).run();
-      let pushed = 0;
-      if (body.push) {
-        pushed = await notifyGroup(env, group.code, 'Група ' + group.code, text);
-      }
-      return json({ ok: true, pushed, announcements: await listAnnouncements(db, group.id) });
-    }
-
-    // POST /api/groups/:code/admin/members — додати члена вручну
-    if (parts.length === 5 && parts[4] === 'members' && method === 'POST') {
-      const body = await readJsonBody(request);
-      if (!body) return json({ error: 'Bad request' }, 400);
-      const lastName = String(body.lastName || '').trim();
-      const firstName = String(body.firstName || '').trim();
-      if (!lastName || !firstName) return json({ error: 'Вкажіть прізвище та ім\'я' }, 400);
-      const check = await checkStudent(env, group.code, lastName, firstName);
-      if (!check.ok) {
-        return json(
-          { error: check.reason === 'not_found' ? 'Вас не знайдено в журналі групи ' + group.code : 'Не вдалося перевірити журнал' },
-          check.reason === 'not_found' ? 404 : 502
-        );
-      }
-      await db.prepare('INSERT OR IGNORE INTO members (group_id, last_name, first_name, role, joined_at) VALUES (?, ?, ?, ?, ?)')
-        .bind(group.id, check.data.last_name, check.data.first_name, 'member', Date.now()).run();
-      return json({ ok: true, members: await listMembers(db, group.id) });
-    }
-
-    // DELETE /api/groups/:code/admin/members/:id — прибрати члена
-    if (parts.length === 6 && parts[4] === 'members' && method === 'DELETE') {
-      const id = Number(parts[5]);
-      if (!Number.isInteger(id)) return json({ error: 'Bad request' }, 400);
-      await db.prepare('DELETE FROM members WHERE id = ? AND group_id = ?').bind(id, group.id).run();
-      return json({ ok: true, members: await listMembers(db, group.id) });
-    }
+  // GET /api/roster/:code/journal — електронний журнал групи
+  if (rest.length === 2 && rest[1] === 'journal') {
+    const data = await groupJournal(env, db, code);
+    return json(data);
   }
 
   return json({ error: 'Not found' }, 404);
@@ -694,9 +597,8 @@ export default {
     if (pathname.startsWith('/api/')) {
       const q = url.searchParams.toString();
 
-      if (pathname.startsWith('/api/groups')) {
-        const res = await handleGroups(request, env, origin, url);
-        if (res) return res;
+      if (pathname.startsWith('/api/roster')) {
+        return handleRoster(request, env, url);
       }
 
       if (pathname === '/api/push/key') {
