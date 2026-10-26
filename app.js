@@ -5,6 +5,9 @@ const LS = {
   mode: 'ep_mode', teacher: 'ep_teacher',
   lastName: 'ep_lastname', firstName: 'ep_firstname',
   pushCreds: 'ep_push_creds',
+  groupCode: 'ep_group_code',
+  groupAdmin: (code) => 'ep_group_admin_' + code,
+  groupMe: (code) => 'ep_group_me_' + code,
   sched: (k, d) => 'ep_sched_' + k + '_' + d,
   journal: (k) => 'ep_journal_' + k,
 };
@@ -878,12 +881,242 @@ function renderMore() {
   renderPayments();
 }
 
+// --- Портал групи ---
+// Список студентів не скрейпиться: кожен реєструється сам, а журнал API
+// підтверджує, що пара «група + ПІБ» справжня. Тому база містить лише тих,
+// хто сам прийшов.
+
+const group = { code: '', data: null };
+
+function groupAdminToken(code) {
+  return localStorage.getItem(LS.groupAdmin(code)) || '';
+}
+
+function groupMe(code) {
+  return readJson(LS.groupMe(code), null);
+}
+
+async function groupApi(path, opts = {}) {
+  const headers = { 'content-type': 'application/json' };
+  const token = groupAdminToken(group.code);
+  if (token) headers.authorization = 'Bearer ' + token;
+  const res = await fetch(path, {
+    method: opts.method || 'GET',
+    headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+function drawGroupHome(el) {
+  const saved = localStorage.getItem(LS.groupCode) || '';
+  el.innerHTML =
+    '<div class="card"><div class="section-title" style="margin-top:0">Портал групи</div>' +
+    '<div class="muted small">Список студентів збирається не скрейпінгом: кожен реєструється сам, а журнал коледжу підтверджує, що ви в цій групі. Тому тут немає чужих ПІБ — лише ті, хто прийшов.</div>' +
+    '<div class="row" style="margin-top:14px"><input id="gCode" class="input" placeholder="Код групи, напр. Т-11" value="' + esc(saved) + '"></div>' +
+    '<button id="gOpen" class="btn block">Відкрити групу</button></div>' +
+    '<div class="card"><div class="section-title" style="margin-top:0">Створити групу</div>' +
+    '<div class="muted small">Створити може лише студент цієї групи: сервер перевірить ваше ПІБ у журналі. Той, хто створив, стає адміном.</div>' +
+    '<div class="row" style="margin-top:12px"><input id="gNewCode" class="input" placeholder="Код групи, напр. Т-11"></div>' +
+    '<div class="row"><input id="gNewName" class="input" placeholder="Назва групи (необов\'язково)"></div>' +
+    '<div class="row"><input id="gLast" class="input" placeholder="Прізвище" value="' + esc(localStorage.getItem(LS.lastName) || '') + '">' +
+    '<input id="gFirst" class="input" placeholder="Ім\'я" value="' + esc(localStorage.getItem(LS.firstName) || '') + '"></div>' +
+    '<div class="row"><input id="gPass" class="input" type="password" placeholder="Пароль адміна"></div>' +
+    '<button id="gCreate" class="btn tonal block">Створити групу</button></div>';
+
+  $('gOpen').onclick = () => {
+    const code = $('gCode').value.trim().toUpperCase();
+    if (!code) return;
+    localStorage.setItem(LS.groupCode, code);
+    location.hash = '#/group/' + encodeURIComponent(code);
+  };
+  $('gCreate').onclick = async () => {
+    const btn = $('gCreate');
+    btn.disabled = true;
+    try {
+      const data = await groupApi('/api/groups', {
+        method: 'POST',
+        body: {
+          code: $('gNewCode').value.trim(),
+          name: $('gNewName').value.trim(),
+          lastName: $('gLast').value.trim(),
+          firstName: $('gFirst').value.trim(),
+          password: $('gPass').value,
+        },
+      });
+      localStorage.setItem(LS.groupCode, data.group.code);
+      if (data.token) localStorage.setItem(LS.groupAdmin(data.group.code), data.token);
+      toast('Групу створено');
+      location.hash = '#/group/' + encodeURIComponent(data.group.code);
+    } catch (e) {
+      toast(e.message || 'Не вдалося створити групу', 'err');
+      btn.disabled = false;
+    }
+  };
+}
+
+function memberName(m) {
+  return (m.last_name || '') + ' ' + (m.first_name || '');
+}
+
+function drawGroupPage(el, data) {
+  const code = data.group.code;
+  const me = groupMe(code);
+  const isAdmin = !!groupAdminToken(code);
+  const members = data.members || [];
+  const announcements = data.announcements || [];
+
+  const myMember = me ? members.find((m) => m.last_name === me.lastName && m.first_name === me.firstName) : null;
+
+  const roster = members.map((m) => {
+    const mine = myMember && m.id === myMember.id;
+    return '<div class="card member-row' + (mine ? ' mine' : '') + '">' +
+      '<div class="member-name">' + esc(memberName(m)) + (m.role === 'admin' ? ' <span class="tag admin">адмін</span>' : '') + '</div>' +
+      (mine ? '<button class="btn tonal small-btn" id="gMyJournal">Мій журнал</button>' : '') +
+      (isAdmin ? '<button class="btn ghost small-btn g-del" data-id="' + m.id + '">Прибрати</button>' : '') +
+      '</div>';
+  }).join('');
+
+  const posts = announcements.length
+    ? announcements.map((a) =>
+        '<div class="card post"><div class="post-head">' + esc(a.author || 'Адмін') + ' · ' + esc(new Date(a.created_at).toLocaleString('uk-UA')) + '</div>' +
+        '<div class="post-body">' + esc(a.body) + '</div></div>').join('')
+    : '<div class="empty">Об\'явлень ще немає</div>';
+
+  el.innerHTML =
+    '<div class="card"><div class="section-title" style="margin-top:0">' + esc(data.group.name || code) + '</div>' +
+    '<div class="muted small">Код групи: <b>' + esc(code) + '</b> · студентів у списку: ' + members.length + '</div>' +
+    (myMember
+      ? '<div class="row" style="margin-top:12px;margin-bottom:0"><button class="btn block" id="gMyJournal2">Відкрити мій журнал</button></div>'
+      : '<div class="row" style="margin-top:12px"><input id="gJoinLast" class="input" placeholder="Ваше прізвище" value="' + esc((me && me.lastName) || localStorage.getItem(LS.lastName) || '') + '">' +
+        '<input id="gJoinFirst" class="input" placeholder="Ваше ім\'я" value="' + esc((me && me.firstName) || localStorage.getItem(LS.firstName) || '') + '"></div>' +
+        '<div class="row" style="margin-bottom:0"><button id="gJoin" class="btn block">Додати мене до списку</button></div>') +
+    '</div>' +
+
+    '<div class="section-title">Список групи</div>' +
+    (members.length ? roster : '<div class="empty">Список порожній — заходьте першим</div>') +
+
+    '<div class="section-title">Об\'явлення</div>' +
+    posts +
+
+    '<div class="section-title">Адмін</div>' +
+    (isAdmin
+      ? '<div class="card"><textarea id="gPost" class="input" rows="3" placeholder="Текст об\'явлення для групи"></textarea>' +
+        '<label class="check"><input type="checkbox" id="gPush"> Надіслати push підписникам групи</label>' +
+        '<button id="gSend" class="btn block" style="margin-top:10px">Опублікувати</button></div>'
+      : '<div class="card"><div class="muted small">Пароль адміна групи — щоб публікувати об\'явлення й керувати списком.</div>' +
+        '<button id="gAdminLogin" class="btn tonal block" style="margin-top:10px">Вхід для адміна</button>' +
+        '<div id="gAdminBox" style="display:none;margin-top:10px"><div class="row"><input id="gAdminPass" class="input" type="password" placeholder="Пароль"></div>' +
+        '<button id="gAdminGo" class="btn block">Увійти</button></div></div>');
+
+  const openJournal = () => {
+    if (!myMember) return;
+    localStorage.setItem(LS.group, code);
+    localStorage.setItem(LS.lastName, myMember.last_name);
+    localStorage.setItem(LS.firstName, myMember.first_name);
+    location.hash = '#/journal';
+  };
+  if ($('gMyJournal')) $('gMyJournal').onclick = openJournal;
+  if ($('gMyJournal2')) $('gMyJournal2').onclick = openJournal;
+
+  const join = $('gJoin');
+  if (join) join.onclick = async () => {
+    join.disabled = true;
+    try {
+      await groupApi('/api/groups/' + encodeURIComponent(code) + '/join', {
+        method: 'POST',
+        body: { lastName: $('gJoinLast').value.trim(), firstName: $('gJoinFirst').value.trim() },
+      });
+      localStorage.setItem(LS.groupMe(code), JSON.stringify({ lastName: $('gJoinLast').value.trim(), firstName: $('gJoinFirst').value.trim() }));
+      toast('Ви в списку групи');
+      renderGroup();
+    } catch (e) {
+      toast(e.message || 'Не вдалося додати', 'err');
+      join.disabled = false;
+    }
+  };
+
+  el.querySelectorAll('.g-del').forEach((b) => b.onclick = async () => {
+    try {
+      await groupApi('/api/groups/' + encodeURIComponent(code) + '/admin/members/' + b.dataset.id, { method: 'DELETE' });
+      toast('Студента прибрано');
+      renderGroup();
+    } catch (e) {
+      toast(e.message || 'Не вдалося прибрати', 'err');
+    }
+  });
+
+  const login = $('gAdminLogin');
+  if (login) login.onclick = () => {
+    $('gAdminBox').style.display = '';
+    login.style.display = 'none';
+    $('gAdminPass').focus();
+  };
+  const go = $('gAdminGo');
+  if (go) go.onclick = async () => {
+    go.disabled = true;
+    try {
+      const data = await groupApi('/api/groups/' + encodeURIComponent(code) + '/admin/login', {
+        method: 'POST',
+        body: { password: $('gAdminPass').value },
+      });
+      localStorage.setItem(LS.groupAdmin(code), data.token);
+      toast('Виконано вхід');
+      renderGroup();
+    } catch (e) {
+      toast(e.message || 'Невірний пароль', 'err');
+      go.disabled = false;
+    }
+  };
+
+  const send = $('gSend');
+  if (send) send.onclick = async () => {
+    const text = $('gPost').value.trim();
+    if (!text) return;
+    send.disabled = true;
+    try {
+      const data = await groupApi('/api/groups/' + encodeURIComponent(code) + '/admin/announcements', {
+        method: 'POST',
+        body: { body: text, push: $('gPush').checked },
+      });
+      toast(data.pushed ? 'Опубліковано, push: ' + data.pushed : 'Опубліковано');
+      renderGroup();
+    } catch (e) {
+      toast(e.message || 'Не вдалося опублікувати', 'err');
+      send.disabled = false;
+    }
+  };
+}
+
+async function renderGroup() {
+  const el = $('groupList');
+  if (!el) return;
+  const hash = location.hash.replace('#/', '');
+  const code = decodeURIComponent(hash.split('/')[1] || '').trim().toUpperCase();
+  group.code = code;
+  if (!code) { drawGroupHome(el); return; }
+  loader(el);
+  try {
+    const data = await groupApi('/api/groups/' + encodeURIComponent(code));
+    group.data = data;
+    drawGroupPage(el, data);
+  } catch (e) {
+    clear(el);
+    el.innerHTML = '<div class="card"><div class="empty">' + esc(e.message || 'Не вдалося відкрити групу') + '</div>' +
+      '<button class="btn tonal block" id="gBack">Інша група</button></div>';
+    $('gBack').onclick = () => { location.hash = '#/group'; };
+  }
+}
+
 async function route() {
   const hash = location.hash || '#/schedule';
-  const name = hash.replace('#/', '') || 'schedule';
-  setView(['schedule', 'journal', 'news', 'more'].includes(name) ? name : 'schedule');
+  const name = hash.replace('#/', '').split('/')[0] || 'schedule';
+  setView(['schedule', 'journal', 'group', 'news', 'more'].includes(name) ? name : 'schedule');
   if (name === 'schedule') renderSchedule();
   else if (name === 'journal') renderJournal();
+  else if (name === 'group') renderGroup();
   else if (name === 'news') renderNews();
   else if (name === 'more') renderMore();
 }

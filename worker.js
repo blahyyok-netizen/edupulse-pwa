@@ -6,11 +6,16 @@ import swJs from './sw.js';
 import icon192 from './icon-192.png';
 import icon512 from './icon-512.png';
 import appleIcon from './apple-touch-icon.png';
-import { encryptPush, generateEcdhKeyPair, signVapidJwt, b64uDecode } from './webpush.mjs';
+import { encryptPush, generateEcdhKeyPair, signVapidJwt, b64uDecode, b64uEncode } from './webpush.mjs';
 
 const TT = 'https://tt.sclnau.com.ua';
 const TT_API = 'https://tt-api.sclnau.com.ua';
 const JOURNAL_API = 'https://journal-api.sclnau.com.ua/api/v1';
+
+// JOURNAL_API_URL — перевизначення бази журнального API для локальних тестів (mock у test/groups.e2e.mjs).
+function journalApiBase(env) {
+  return (env && env.JOURNAL_API_URL) || JOURNAL_API;
+}
 const WP = 'https://sclnau.com.ua/wp-json/wp/v2';
 
 const GOOGLE_CLIENT_ID = '510124052044-i8hhrh7s4ijmfn0jstm2hktghp94pvup.apps.googleusercontent.com';
@@ -164,7 +169,7 @@ async function fetchJournalFor(env, sub) {
     first_name: sub.firstName,
   });
   try {
-    const res = await fetch(JOURNAL_API + '/journal/?' + q.toString(), {
+    const res = await fetch(journalApiBase(env) + '/journal/?' + q.toString(), {
       headers: { 'X-Auth-Token': token, 'user-agent': 'okhttp/4.12.0' },
     });
     if (!res.ok) return null;
@@ -322,6 +327,294 @@ async function checkSubscription(env, sub, keyPair, journal) {
   return { dead: false, changed, notify: changes.length > 0 };
 }
 
+// --- Портал на групу ---
+// Список студентів не збирається скрейпінгом: студент сам реєструється
+// (група + ПІБ), а журнал API підтверджує, що ця пара реальна. Тому в базі
+// лежать тільки ПІБ тих, хто сам прийшов.
+
+const GROUP_CODE_RE = /^[0-9A-ZА-ЯІЇЄҐ][0-9A-ZА-ЯІЇЄҐ\-]{1,15}$/;
+const GROUP_TOKEN_TTL = 30 * 24 * 3600 * 1000;
+const GROUP_ANNOUNCE_LIMIT = 50;
+
+function normalizeCode(code) {
+  return String(code || '').trim().toUpperCase().replace(/\s+/g, '');
+}
+
+async function hmacBytes(secret, data) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, bytes));
+}
+
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+async function signToken(payload, secret) {
+  const body = b64uEncode(new TextEncoder().encode(JSON.stringify(payload)));
+  return body + '.' + b64uEncode(await hmacBytes(secret, body));
+}
+
+async function readToken(token, secret) {
+  if (!token || !secret) return null;
+  const parts = String(token).split('.');
+  if (parts.length !== 2) return null;
+  if (!sameBytes(b64uDecode(parts[1]), await hmacBytes(secret, parts[0]))) return null;
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(b64uDecode(parts[0])));
+    if (!payload || !payload.e || payload.e < Date.now()) return null;
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function passwordHash(password, saltB64) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: b64uDecode(saltB64), iterations: 100000, hash: 'SHA-256' }, key, 256
+  );
+  return b64uEncode(new Uint8Array(bits));
+}
+
+async function makePasswordHash(password) {
+  const salt = b64uEncode(crypto.getRandomValues(new Uint8Array(16)));
+  return salt + ':' + await passwordHash(password, salt);
+}
+
+async function checkPassword(password, stored) {
+  const parts = String(stored || '').split(':');
+  if (parts.length !== 2) return false;
+  return sameBytes(b64uDecode(await passwordHash(password, parts[0])), b64uDecode(parts[1]));
+}
+
+// Перевірка студента: журнал API відповідає 200 лише для справжньої пари
+// «група + прізвище + ім'я» (для чужої групи або неіснуючого — 404).
+async function checkStudent(env, group, lastName, firstName) {
+  const token = (env && env.JOURNAL_API_TOKEN) || PUBLIC_JOURNAL_TOKEN;
+  const q = new URLSearchParams({ group, last_name: lastName, first_name: firstName });
+  try {
+    const res = await fetch(journalApiBase(env) + '/journal/?' + q.toString(), {
+      headers: { 'X-Auth-Token': token, 'user-agent': 'okhttp/4.12.0' },
+    });
+    if (res.status === 404) return { ok: false, reason: 'not_found' };
+    if (!res.ok) return { ok: false, reason: 'error' };
+    const data = await res.json();
+    if (!data || !data.student_id) return { ok: false, reason: 'not_found' };
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, reason: 'error' };
+  }
+}
+
+async function readJsonBody(request) {
+  try {
+    return await request.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+async function findGroup(db, code) {
+  return db.prepare('SELECT id, code, name, admin_hash, created_at FROM groups WHERE code = ?').bind(code).first();
+}
+
+async function listMembers(db, groupId) {
+  const res = await db.prepare(
+    'SELECT id, last_name, first_name, role, joined_at FROM members WHERE group_id = ? ORDER BY last_name, first_name'
+  ).bind(groupId).all();
+  return res.results || [];
+}
+
+async function listAnnouncements(db, groupId) {
+  const res = await db.prepare(
+    'SELECT id, author, body, created_at FROM announcements WHERE group_id = ? ORDER BY id DESC LIMIT ?'
+  ).bind(groupId, GROUP_ANNOUNCE_LIMIT).all();
+  return res.results || [];
+}
+
+async function requireAdmin(request, env, groupId) {
+  if (!env.AUTH_SECRET) return null;
+  const header = request.headers.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const payload = await readToken(token, env.AUTH_SECRET);
+  if (!payload || payload.r !== 'admin' || payload.g !== groupId) return null;
+  return payload;
+}
+
+// Сповіщення всім підписникам групи: журнал сберігається в KV разом із групою,
+// тож фільтр — це просто збіг коду групи.
+async function notifyGroup(env, code, title, body) {
+  if (!env.PUSH_SUBS) return 0;
+  let names = [];
+  try {
+    names = await listKvKeys(env.PUSH_SUBS, PUSH_PREFIX);
+  } catch (e) {
+    return 0;
+  }
+  if (!names.length) return 0;
+  const keyPair = await generateEcdhKeyPair();
+  let sent = 0;
+  for (const name of names) {
+    const raw = await env.PUSH_SUBS.get(name);
+    if (!raw) continue;
+    let sub = null;
+    try { sub = JSON.parse(raw); } catch (e) { continue; }
+    if (normalizeCode(sub.group) !== code) continue;
+    const res = await sendPush(env, sub, { title, body, url: '/#/group/' + encodeURIComponent(code), tag: 'group-' + code }, keyPair);
+    if (res.ok) sent++;
+    else if (res.status === 404 || res.status === 410) await env.PUSH_SUBS.delete(name);
+  }
+  return sent;
+}
+
+async function handleGroups(request, env, origin, url) {
+  if (!env.DB) return json({ error: 'Групи не налаштовані' }, 503);
+  const db = env.DB;
+  const parts = url.pathname.split('/').filter(Boolean); // api / groups [...]
+  const method = request.method;
+
+  // POST /api/groups — створити групу (тільки реальний студент цієї групи)
+  if (parts.length === 2 && method === 'POST') {
+    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+    const body = await readJsonBody(request);
+    if (!body) return json({ error: 'Bad request' }, 400);
+    const code = normalizeCode(body.code);
+    const name = String(body.name || '').trim() || code;
+    const password = String(body.password || '');
+    const lastName = String(body.lastName || '').trim();
+    const firstName = String(body.firstName || '').trim();
+    if (!GROUP_CODE_RE.test(code)) return json({ error: 'Код групи має вигляд Т-11' }, 400);
+    if (password.length < 4) return json({ error: 'Пароль адміна — щонайменше 4 символи' }, 400);
+    if (!lastName || !firstName) return json({ error: 'Вкажіть прізвище та ім\'я' }, 400);
+    if (await findGroup(db, code)) return json({ error: 'Така група вже існує' }, 409);
+
+    const check = await checkStudent(env, code, lastName, firstName);
+    if (!check.ok) {
+      return json(
+        { error: check.reason === 'not_found' ? 'Вас не знайдено в журналі групи ' + code : 'Не вдалося перевірити журнал' },
+        check.reason === 'not_found' ? 404 : 502
+      );
+    }
+
+    const now = Date.now();
+    await db.prepare('INSERT INTO groups (code, name, admin_hash, created_at) VALUES (?, ?, ?, ?)')
+      .bind(code, name, await makePasswordHash(password), now).run();
+    const group = await findGroup(db, code);
+    await db.prepare('INSERT OR IGNORE INTO members (group_id, last_name, first_name, role, joined_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(group.id, check.data.last_name, check.data.first_name, 'admin', now).run();
+
+    let token = null;
+    if (env.AUTH_SECRET) {
+      token = await signToken({ g: group.id, r: 'admin', e: Date.now() + GROUP_TOKEN_TTL }, env.AUTH_SECRET);
+    }
+    return json({ ok: true, group: { code: group.code, name: group.name }, token });
+  }
+
+  // GET /api/groups/:code — група, список, об'явлення
+  if (parts.length === 3 && method === 'GET') {
+    const group = await findGroup(db, normalizeCode(decodeURIComponent(parts[2])));
+    if (!group) return json({ error: 'Групу не знайдено' }, 404);
+    return json({
+      ok: true,
+      group: { code: group.code, name: group.name },
+      members: await listMembers(db, group.id),
+      announcements: await listAnnouncements(db, group.id),
+    });
+  }
+
+  // POST /api/groups/:code/join — самозапис студента
+  if (parts.length === 4 && parts[3] === 'join' && method === 'POST') {
+    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+    const group = await findGroup(db, normalizeCode(decodeURIComponent(parts[2])));
+    if (!group) return json({ error: 'Групу не знайдено' }, 404);
+    const body = await readJsonBody(request);
+    if (!body) return json({ error: 'Bad request' }, 400);
+    const lastName = String(body.lastName || '').trim();
+    const firstName = String(body.firstName || '').trim();
+    if (!lastName || !firstName) return json({ error: 'Вкажіть прізвище та ім\'я' }, 400);
+
+    const check = await checkStudent(env, group.code, lastName, firstName);
+    if (!check.ok) {
+      return json(
+        { error: check.reason === 'not_found' ? 'Вас не знайдено в журналі групи ' + group.code : 'Не вдалося перевірити журнал' },
+        check.reason === 'not_found' ? 404 : 502
+      );
+    }
+    await db.prepare('INSERT OR IGNORE INTO members (group_id, last_name, first_name, role, joined_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(group.id, check.data.last_name, check.data.first_name, 'member', Date.now()).run();
+    return json({ ok: true, members: await listMembers(db, group.id) });
+  }
+
+  // POST /api/groups/:code/admin/login — вхід адміна
+  if (parts.length === 5 && parts[3] === 'admin' && parts[4] === 'login' && method === 'POST') {
+    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+    if (!env.AUTH_SECRET) return json({ error: 'Пароль адміна не налаштований' }, 503);
+    const group = await findGroup(db, normalizeCode(decodeURIComponent(parts[2])));
+    if (!group) return json({ error: 'Групу не знайдено' }, 404);
+    const body = await readJsonBody(request);
+    if (!body || !(await checkPassword(String(body.password || ''), group.admin_hash))) {
+      return json({ error: 'Невірний пароль' }, 401);
+    }
+    const token = await signToken({ g: group.id, r: 'admin', e: Date.now() + GROUP_TOKEN_TTL }, env.AUTH_SECRET);
+    return json({ ok: true, token });
+  }
+
+  const group = parts.length >= 3 ? await findGroup(db, normalizeCode(decodeURIComponent(parts[2]))) : null;
+  if (parts.length >= 4 && parts[3] === 'admin' && group) {
+    if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+    if (!(await requireAdmin(request, env, group.id))) return json({ error: 'Немає прав адміна' }, 403);
+
+    // POST /api/groups/:code/admin/announcements — об'явлення
+    if (parts.length === 5 && parts[4] === 'announcements' && method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body) return json({ error: 'Bad request' }, 400);
+      const text = String(body.body || '').trim().slice(0, 1000);
+      if (!text) return json({ error: 'Порожнє об\'явлення' }, 400);
+      const now = Date.now();
+      await db.prepare('INSERT INTO announcements (group_id, author, body, created_at) VALUES (?, ?, ?, ?)')
+        .bind(group.id, 'Адмін', text, now).run();
+      let pushed = 0;
+      if (body.push) {
+        pushed = await notifyGroup(env, group.code, 'Група ' + group.code, text);
+      }
+      return json({ ok: true, pushed, announcements: await listAnnouncements(db, group.id) });
+    }
+
+    // POST /api/groups/:code/admin/members — додати члена вручну
+    if (parts.length === 5 && parts[4] === 'members' && method === 'POST') {
+      const body = await readJsonBody(request);
+      if (!body) return json({ error: 'Bad request' }, 400);
+      const lastName = String(body.lastName || '').trim();
+      const firstName = String(body.firstName || '').trim();
+      if (!lastName || !firstName) return json({ error: 'Вкажіть прізвище та ім\'я' }, 400);
+      const check = await checkStudent(env, group.code, lastName, firstName);
+      if (!check.ok) {
+        return json(
+          { error: check.reason === 'not_found' ? 'Вас не знайдено в журналі групи ' + group.code : 'Не вдалося перевірити журнал' },
+          check.reason === 'not_found' ? 404 : 502
+        );
+      }
+      await db.prepare('INSERT OR IGNORE INTO members (group_id, last_name, first_name, role, joined_at) VALUES (?, ?, ?, ?, ?)')
+        .bind(group.id, check.data.last_name, check.data.first_name, 'member', Date.now()).run();
+      return json({ ok: true, members: await listMembers(db, group.id) });
+    }
+
+    // DELETE /api/groups/:code/admin/members/:id — прибрати члена
+    if (parts.length === 6 && parts[4] === 'members' && method === 'DELETE') {
+      const id = Number(parts[5]);
+      if (!Number.isInteger(id)) return json({ error: 'Bad request' }, 400);
+      await db.prepare('DELETE FROM members WHERE id = ? AND group_id = ?').bind(id, group.id).run();
+      return json({ ok: true, members: await listMembers(db, group.id) });
+    }
+  }
+
+  return json({ error: 'Not found' }, 404);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -400,6 +693,11 @@ export default {
 
     if (pathname.startsWith('/api/')) {
       const q = url.searchParams.toString();
+
+      if (pathname.startsWith('/api/groups')) {
+        const res = await handleGroups(request, env, origin, url);
+        if (res) return res;
+      }
 
       if (pathname === '/api/push/key') {
         return json({ publicKey: VAPID_PUBLIC_KEY });
@@ -484,7 +782,7 @@ export default {
         return passThrough(TT, '/others/payments.json');
       }
       if (pathname === '/api/journal') {
-        return passThrough(JOURNAL_API, '/journal/' + (q ? '?' + q : ''), {
+        return passThrough(journalApiBase(env), '/journal/' + (q ? '?' + q : ''), {
           headers: { 'X-Auth-Token': journalToken },
         });
       }
