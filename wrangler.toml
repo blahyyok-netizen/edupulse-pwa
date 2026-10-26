@@ -6,3 +6,10 @@ rules = [
   { type = "Data", globs = ["**/*.png"], fallthrough = true },
   { type = "Text", globs = ["**/*.html", "**/*.css", "**/*.js", "**/*.webmanifest"], fallthrough = true }
 ]
+
+[[kv_namespaces]]
+binding = "PUSH_SUBS"
+id = "b67009a3d60e4107bc0b2730ccd31cf7"
+
+[triggers]
+crons = ["23,53 * * * *"]

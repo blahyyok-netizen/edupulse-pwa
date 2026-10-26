@@ -4,6 +4,7 @@ const LS = {
   profile: 'ep_profile', group: 'ep_group', theme: 'ep_theme',
   mode: 'ep_mode', teacher: 'ep_teacher',
   lastName: 'ep_lastname', firstName: 'ep_firstname',
+  pushCreds: 'ep_push_creds',
   sched: (k, d) => 'ep_sched_' + k + '_' + d,
   journal: (k) => 'ep_journal_' + k,
 };
@@ -343,6 +344,7 @@ function renderCalendar() {
   box.innerHTML =
     '<div class="cal-head"><button class="cal-nav" id="calPrev" aria-label="Назад">&#8249;</button>' +
     '<div class="cal-title" id="calTitle">' + MONTHS[m] + ' ' + y + '</div>' +
+    '<button class="cal-today" id="calToday">Сьогодні</button>' +
     '<button class="cal-nav" id="calNext" aria-label="Вперед">&#8250;</button></div>' +
     '<div class="cal-wd">' + WD.map((w) => '<span>' + w + '</span>').join('') + '</div>' +
     '<div class="cal-grid">' + cells.map((d) => {
@@ -368,6 +370,14 @@ function renderCalendar() {
     state.calY = b.getFullYear();
     state.calM = b.getMonth();
     renderCalendar();
+  };
+  $('calToday').onclick = () => {
+    const iso = todayISO();
+    state.selectedDate = iso;
+    const b = new Date(iso + 'T00:00:00');
+    state.calY = b.getFullYear();
+    state.calM = b.getMonth();
+    renderSchedule();
   };
   box.querySelectorAll('.cal-cell').forEach((c) => c.onclick = () => {
     const iso = c.dataset.d;
@@ -496,32 +506,39 @@ function drawSchedule(data, fromCache) {
 async function renderJournal() {
   const el = $('journalList');
   const profile = await loadProfile();
-  const group = localStorage.getItem(LS.group) || '';
+  const managed = profile && Array.isArray(profile.managed_groups) ? profile.managed_groups.filter(Boolean) : [];
+  const group = localStorage.getItem(LS.group) || (managed.length === 1 ? managed[0] : '');
   const first = (profile && profile.first_name) || localStorage.getItem(LS.firstName) || '';
   const last = (profile && profile.last_name) || localStorage.getItem(LS.lastName) || '';
 
   const head = $('journalHead');
   if (!head.dataset.ready) {
     head.innerHTML =
-      '<div class="row"><input id="jGroup" class="input" placeholder="Група" value="' + esc(group) + '"></div>' +
+      '<div class="row"><input id="jGroup" class="input" placeholder="Група" value="' + esc(group) + '"' + (managed.length ? ' list="jGroupList"' : '') + '></div>' +
+      (managed.length ? '<datalist id="jGroupList">' + managed.map((g) => '<option value="' + esc(g) + '">').join('') + '</datalist>' : '') +
       '<div class="row"><input id="jLast" class="input" placeholder="Прізвище" value="' + esc(last) + '"><input id="jFirst" class="input" placeholder="Ім\'я" value="' + esc(first) + '"></div>' +
       '<button id="jGo" class="btn block">Показати журнал</button>' +
-      '<div class="muted small" style="margin-top:8px">Журнал відкривається без входу — дані з сервера коледжу.</div>';
+      '<div class="muted small" style="margin-top:8px">Журнал відкривається без входу — дані з сервера коледжу.</div>' +
+      '<div class="row" style="margin-top:16px;margin-bottom:0"><button id="pushBtn" class="btn ghost block">🔔 Увімкнути сповіщення</button></div>' +
+      '<div class="muted small" id="pushHint" style="margin-top:6px"></div>';
     head.dataset.ready = '1';
-    $('jGroup').oninput = () => localStorage.setItem(LS.group, $('jGroup').value);
-    $('jLast').oninput = () => localStorage.setItem(LS.lastName, $('jLast').value);
-    $('jFirst').oninput = () => localStorage.setItem(LS.firstName, $('jFirst').value);
+    $('jGroup').oninput = () => { localStorage.setItem(LS.group, $('jGroup').value); drawPushRow(); };
+    $('jLast').oninput = () => { localStorage.setItem(LS.lastName, $('jLast').value); drawPushRow(); };
+    $('jFirst').oninput = () => { localStorage.setItem(LS.firstName, $('jFirst').value); drawPushRow(); };
     $('jGo').onclick = () => {
       localStorage.setItem(LS.group, $('jGroup').value);
       localStorage.setItem(LS.lastName, $('jLast').value);
       localStorage.setItem(LS.firstName, $('jFirst').value);
       fetchJournal($('jGroup').value.trim(), $('jLast').value.trim(), $('jFirst').value.trim());
     };
+    $('pushBtn').onclick = () => (push.subscription ? disablePush() : enablePush());
   } else {
     $('jGroup').value = group;
     if (last) $('jLast').value = last;
     if (first) $('jFirst').value = first;
   }
+
+  refreshPushState();
 
   const g = $('jGroup').value.trim();
   const l = $('jLast').value.trim();
@@ -545,6 +562,7 @@ async function fetchJournal(group, last, first) {
   if (!data && cached) data = cached;
   if (!data) { empty(el, 'Не вдалося завантажити журнал'); return; }
   drawJournal(data, false);
+  syncPushCreds();
 }
 
 function drawJournal(data, fromCache) {
@@ -573,6 +591,180 @@ function drawJournal(data, fromCache) {
       '<div class="subject-body">' + lessons + '</div></div>';
   }).join('') + (fromCache ? '<div class="empty small">показано з кешу</div>' : '');
   el.querySelectorAll('.subject-head').forEach((h) => h.onclick = () => h.parentElement.classList.toggle('open'));
+}
+
+// --- Сповіщення (Web Push) ---
+
+const push = {
+  supported: 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window,
+  subscription: null,
+};
+
+function b64ToBytes(base64) {
+  const s = String(base64).replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(s + '='.repeat((4 - (s.length % 4)) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function journalCreds() {
+  const val = (id, key) => {
+    const el = $(id);
+    return (el && el.value.trim()) || localStorage.getItem(key) || '';
+  };
+  return {
+    group: val('jGroup', LS.group),
+    lastName: val('jLast', LS.lastName),
+    firstName: val('jFirst', LS.firstName),
+  };
+}
+
+function isStandalone() {
+  return matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+}
+
+function isIos() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+function pushHint(text) {
+  const el = $('pushHint');
+  if (el) el.textContent = text;
+}
+
+function drawPushRow() {
+  const btn = $('pushBtn');
+  if (!btn) return;
+  if (!push.supported) {
+    btn.disabled = true;
+    btn.textContent = '🔕 Сповіщення недоступні';
+    pushHint('Браузер не підтримує push. На iPhone додайте сайт на головний екран (Safari → «Поділитися» → «На екран “Домів”») і відкривайте звідти.');
+    return;
+  }
+  if (isIos() && !isStandalone()) {
+    btn.disabled = true;
+    btn.textContent = '🔕 Сповіщення недоступні';
+    pushHint('На iPhone сповіщення працюють лише у встановленому застосунку: «Поділитися» → «На екран “Домів”», далі відкривайте застосунок звідти.');
+    return;
+  }
+  if (Notification.permission === 'denied') {
+    btn.disabled = true;
+    btn.textContent = '🔕 Сповіщення заборонені';
+    pushHint('Дозвіл на сповіщення можна повернути в налаштуваннях сайту в браузері.');
+    return;
+  }
+  const creds = journalCreds();
+  const ready = creds.group && creds.lastName && creds.firstName;
+  btn.disabled = !ready && !push.subscription;
+  btn.textContent = push.subscription ? '🔕 Вимкнути сповіщення' : '🔔 Увімкнути сповіщення';
+  if (!ready) {
+    pushHint('Спершу вкажіть групу та ПІБ — інакше немає кого перевіряти в журналі.');
+  } else {
+    pushHint('Сповіщення приходять, коли в журналі з’явиться нова оцінка. Журнал перевіряється двічі на годину.');
+  }
+}
+
+async function pushRegistration() {
+  const ready = navigator.serviceWorker.ready;
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000));
+  return Promise.race([ready, timeout]);
+}
+
+async function refreshPushState() {
+  if (!push.supported) { drawPushRow(); return; }
+  try {
+    const reg = await pushRegistration();
+    push.subscription = await reg.pushManager.getSubscription();
+  } catch (e) {
+    push.subscription = null;
+  }
+  drawPushRow();
+}
+
+async function sendPushSubscription(sub, creds) {
+  const res = await fetch('/api/push/subscribe', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      subscription: { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } },
+      group: creds.group,
+      lastName: creds.lastName,
+      firstName: creds.firstName,
+    }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || ('HTTP ' + res.status));
+  }
+  localStorage.setItem(LS.pushCreds, JSON.stringify(creds));
+}
+
+async function enablePush() {
+  const creds = journalCreds();
+  if (!creds.group || !creds.lastName || !creds.firstName) {
+    toast('Спершу вкажіть групу та ПІБ', 'err');
+    return;
+  }
+  const btn = $('pushBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') {
+      toast('Сповіщення не дозволено', 'err');
+      drawPushRow();
+      return;
+    }
+    const cfg = await apiJson('/api/push/key');
+    if (!cfg.publicKey) throw new Error('сервер не віддав ключ сповіщень');
+    const reg = await pushRegistration();
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: b64ToBytes(cfg.publicKey),
+      });
+    }
+    push.subscription = sub;
+    await sendPushSubscription(sub, creds);
+    toast('Сповіщення увімкнено');
+  } catch (e) {
+    toast('Не вдалося увімкнути сповіщення: ' + (e.message || e), 'err');
+  }
+  drawPushRow();
+}
+
+async function disablePush() {
+  const sub = push.subscription;
+  try {
+    if (sub) {
+      await fetch('/api/push/unsubscribe', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ endpoint: sub.endpoint }),
+      }).catch(() => null);
+      await sub.unsubscribe();
+    }
+    push.subscription = null;
+    localStorage.removeItem(LS.pushCreds);
+    toast('Сповіщення вимкнено');
+  } catch (e) {
+    toast('Не вдалося вимкнути сповіщення', 'err');
+  }
+  drawPushRow();
+}
+
+// Якщо підписка вже є, а студент змінився — оновлюємо дані на сервері.
+async function syncPushCreds() {
+  if (!push.subscription) return;
+  const creds = journalCreds();
+  if (!creds.group || !creds.lastName || !creds.firstName) return;
+  const saved = readJson(LS.pushCreds, null);
+  if (saved && saved.group === creds.group && saved.lastName === creds.lastName && saved.firstName === creds.firstName) return;
+  try {
+    await sendPushSubscription(push.subscription, creds);
+  } catch (e) { }
 }
 
 async function renderNews() {

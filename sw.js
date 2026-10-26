@@ -31,6 +31,41 @@ self.addEventListener('message', (e) => {
   }
 });
 
+self.addEventListener('push', (e) => {
+  let data = {};
+  try {
+    data = e.data ? e.data.json() : {};
+  } catch (err) {
+    data = { body: e.data ? e.data.text() : '' };
+  }
+  const title = data.title || 'Навчальний Пульс';
+  e.waitUntil(
+    self.registration.showNotification(title, {
+      body: data.body || '',
+      icon: '/icon-192.png',
+      badge: '/icon-192.png',
+      tag: data.tag || 'journal',
+      renotify: true,
+      data: { url: data.url || '/#/journal' },
+    })
+  );
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || '/#/journal';
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
+      for (const c of list) {
+        if ('focus' in c) {
+          return c.focus().then(() => (c.navigate ? c.navigate(url) : null));
+        }
+      }
+      return self.clients.openWindow(url);
+    })
+  );
+});
+
 // Приватні відповіді (з авторизацією) і помилки не кешуємо.
 function cacheable(res) {
   if (!res || !res.ok) return false;

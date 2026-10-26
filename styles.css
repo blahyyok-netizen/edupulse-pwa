@@ -84,6 +84,8 @@ body {
 .btn:active { transform: scale(.97); }
 .btn.block { width: 100%; }
 .btn.tonal { background: var(--primary-container); color: var(--primary); }
+.btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+.btn:disabled { opacity: .5; cursor: default; }
 
 .dates { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 12px; scrollbar-width: none; }
 .dates::-webkit-scrollbar { display: none; }
@@ -95,8 +97,9 @@ body {
 .date-chip.active { background: var(--primary); color: var(--on-primary); border-color: transparent; }
 
 .cal { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 12px 14px 14px; margin-bottom: 14px; user-select: none; }
-.cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
-.cal-title { font-weight: 700; font-size: 14.5px; cursor: pointer; }
+.cal-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 10px; }
+.cal-title { flex: 1; text-align: center; font-weight: 700; font-size: 14.5px; cursor: pointer; }
+.cal-today { font: inherit; font-size: 12.5px; font-weight: 600; color: var(--primary); background: var(--primary-container); border: 0; border-radius: 999px; padding: 6px 10px; cursor: pointer; white-space: nowrap; }
 .cal-nav { width: 34px; height: 34px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-variant); color: var(--text); font-size: 16px; cursor: pointer; }
 .cal-nav:active { transform: scale(.94); }
 .cal-wd { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 6px; }
