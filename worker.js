@@ -12,7 +12,7 @@ const TT = 'https://tt.sclnau.com.ua';
 const TT_API = 'https://tt-api.sclnau.com.ua';
 const JOURNAL_API = 'https://journal-api.sclnau.com.ua/api/v1';
 
-// JOURNAL_API_URL — перевизначення бази журнального API для локальних тестів (mock у test/groups.e2e.mjs).
+// JOURNAL_API_URL — перевизначення бази журнального API для локальних тестів (mock у test/roster.e2e.mjs і test/push.e2e.mjs).
 function journalApiBase(env) {
   return (env && env.JOURNAL_API_URL) || JOURNAL_API;
 }
