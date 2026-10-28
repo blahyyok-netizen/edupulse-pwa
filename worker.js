@@ -16,6 +16,8 @@ const TT_API = 'https://tt-api.sclnau.com.ua';
 // Firebase). Єдиний секрет у проекті — приватний ключ VAPID.
 const GOOGLE_CLIENT_ID = '510124052044-i8hhrh7s4ijmfn0jstm2hktghp94pvup.apps.googleusercontent.com';
 const FIREBASE_API_KEY = 'AIzaSyD2QDru_xQHFAZ1rad97jnUi-DEcnTR0Rw';
+const FIREBASE_AUTH_DOMAIN = 'edupulse-main.firebaseapp.com';
+const FIREBASE_PROJECT_ID = 'edupulse-main';
 const WORKSPACE_DOMAIN = 'sclnau.com.ua';
 const WP = 'https://sclnau.com.ua/wp-json/wp/v2';
 
@@ -131,14 +133,30 @@ async function getAuthConfig(env) {
   return authConfig;
 }
 
-// Google-токен -> сесія Firebase. requestUri має належати Firebase-проєкту коледжу.
-async function firebaseExchange(env, idToken, requestUri) {
-  const postBody = new URLSearchParams({ id_token: idToken, providerId: 'google.com' }).toString();
-  return fetch(firebaseBase(env) + '/v1/accounts:signInWithIdp?key=' + FIREBASE_API_KEY, {
+// Перевірка токена на боці Firebase: відповідь приходить лише для справжнього
+// токена цього проєкту (підпис перевіряє сам Firebase).
+async function firebaseLookup(env, idToken) {
+  const res = await fetch(firebaseBase(env) + '/v1/accounts:lookup?key=' + FIREBASE_API_KEY, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ postBody, requestUri, returnIdpCredential: true, returnSecureToken: true }),
-  });
+    body: JSON.stringify({ idToken }),
+  }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const data = await res.json().catch(() => null);
+  const users = data && Array.isArray(data.users) ? data.users : [];
+  return users[0] || null;
+}
+
+// Твердження токена без підпису — лише щоб дізнатися термін дії.
+function jwtClaims(token) {
+  try {
+    const part = String(token).split('.')[1];
+    if (!part) return null;
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4)));
+  } catch (e) {
+    return null;
+  }
 }
 
 // Оновлення сесії: refresh-токен -> новий id-токен (живе до години).
@@ -498,7 +516,11 @@ export default {
       if (pathname === '/api/config') {
         const cfg = await getAuthConfig(env);
         return json({
-          googleClientId: cfg.google_client_id || GOOGLE_CLIENT_ID,
+          firebase: {
+            apiKey: FIREBASE_API_KEY,
+            authDomain: FIREBASE_AUTH_DOMAIN,
+            projectId: FIREBASE_PROJECT_ID,
+          },
           workspaceDomain: cfg.workspace_domain || WORKSPACE_DOMAIN,
         });
       }
@@ -513,23 +535,26 @@ export default {
         if (!body || !body.idToken) return json({ error: 'idToken required' }, 400);
         const cfg = await getAuthConfig(env);
         const domain = cfg.workspace_domain || WORKSPACE_DOMAIN;
-        const res = await firebaseExchange(env, body.idToken, 'https://' + domain);
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data) {
-          return json({ error: 'Auth failed', details: data && data.error ? data.error.message : null }, res.status || 500);
-        }
-        const email = (data.email || '').toLowerCase();
+        // Токен випустив Firebase-проєкт коледжу — той самий, що й в офіційному
+        // застосунку. Кабінет приймає саме такі токени.
+        const user = await firebaseLookup(env, body.idToken);
+        if (!user) return json({ error: 'Auth failed', details: 'Невірний токен' }, 401);
+        const email = (user.email || '').toLowerCase();
         if (!email || !email.endsWith('@' + domain)) {
           return json({ error: 'Account not allowed', details: 'Доступ лише для акаунтів @' + domain }, 403);
         }
+        const claims = jwtClaims(body.idToken);
+        const expiresIn = claims && claims.exp
+          ? Math.max(60, claims.exp - Math.floor(Date.now() / 1000))
+          : 3600;
         return json({
-          idToken: data.idToken,
-          refreshToken: data.refreshToken,
-          expiresIn: data.expiresIn,
-          email: data.email || null,
-          displayName: data.displayName || null,
-          photoUrl: data.photoUrl || null,
-          localId: data.localId,
+          idToken: body.idToken,
+          refreshToken: body.refreshToken || null,
+          expiresIn,
+          email: user.email || null,
+          displayName: user.displayName || null,
+          photoUrl: user.photoUrl || null,
+          localId: user.localId || null,
         });
       }
       if (pathname === '/api/refresh' && request.method === 'POST') {

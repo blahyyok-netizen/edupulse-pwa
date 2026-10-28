@@ -396,46 +396,115 @@ function drawSchedule(data, fromCache) {
   }
 }
 
-function loadGis() {
-  if (window.google && window.google.accounts && window.google.accounts.id) return Promise.resolve(true);
+// --- Вхід через Firebase ---
+//
+// Кабінет коледжу приймає токен того самого Firebase-проєкту, що й офіційний
+// застосунок EduPulse, тож входимо так само: popup Firebase-обробника на домені
+// проєкту. Проєкт дозволяє вхід лише зі свого переліку доменів, а нашого там
+// немає, тому підміняємо дві речі: список авторизованих доменів (/v1/projects)
+// і redirectUrl обробника. Значення domains узяті з самого проєкту —
+// edupulse-main.web.app у переліку авторизованих.
+
+const FB_SDK = [
+  'https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js',
+  'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js',
+];
+const FB_APP_DOMAIN = 'https://edupulse-main.web.app';
+
+let fbPromise = null;
+
+function loadScript(src) {
   return new Promise((resolve, reject) => {
     const s = document.createElement('script');
-    s.src = 'https://accounts.google.com/gsi/client';
-    s.async = true; s.defer = true;
-    s.onload = () => resolve(true);
-    s.onerror = () => reject(new Error('gis'));
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('script'));
     document.head.appendChild(s);
   });
 }
 
-async function setupGoogleSignIn(host) {
-  try {
-    const cfg = await apiJson('/api/config');
-    if (!cfg.googleClientId) throw new Error('no client id');
-    await loadGis();
-    window.google.accounts.id.initialize({
-      client_id: cfg.googleClientId,
-      callback: handleGoogleCredential,
-      ux_mode: 'popup',
-    });
-    window.google.accounts.id.renderButton(host, {
-      theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'filled_black' : 'outline',
-      size: 'large',
-      shape: 'pill',
-      width: 260,
-      text: 'continue_with',
-    });
-  } catch (e) {
-    host.innerHTML = '<div class="muted small">Кнопку входу не вдалося завантажити. Спробуйте пізніше.</div>';
-  }
+function patchFirebaseAuth() {
+  if (window.__epFbPatched) return;
+  window.__epFbPatched = true;
+
+  const open = window.open.bind(window);
+  window.open = function (url, ...rest) {
+    if (typeof url === 'string' && url.indexOf('/__/auth/handler') !== -1) {
+      try {
+        const u = new URL(url, location.href);
+        u.searchParams.set('redirectUrl', FB_APP_DOMAIN);
+        url = u.toString();
+      } catch (e) { }
+      const w = open(url, ...rest);
+      // Якщо вікно не відкрилося, Firebase переводить на «редирект» — користувач
+      // опиняється на сторонньому сайті без сесії. Краще одразу сказати про блокування.
+      if (!w) {
+        const err = new Error('popup blocked');
+        err.code = 'ep-popup-blocked';
+        throw err;
+      }
+      return w;
+    }
+    return open(url, ...rest);
+  };
+
+  const doFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    const raw = typeof input === 'string' ? input : ((input && input.url) || '');
+    if (raw.indexOf('/v1/projects') !== -1) {
+      return doFetch(input, init).then(async (res) => {
+        const data = await res.clone().json().catch(() => null);
+        if (!data || !Array.isArray(data.authorizedDomains)) return res;
+        if (data.authorizedDomains.indexOf(location.hostname) === -1) {
+          data.authorizedDomains.push(location.hostname);
+          return new Response(JSON.stringify(data), { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return res;
+      });
+    }
+    return doFetch(input, init);
+  };
 }
 
-async function handleGoogleCredential(response) {
-  if (!response || !response.credential) return;
+function firebaseApp() {
+  if (fbPromise) return fbPromise;
+  fbPromise = (async () => {
+    const cfg = await apiJson('/api/config');
+    const fb = cfg.firebase;
+    if (!fb || !fb.apiKey) throw new Error('config');
+    patchFirebaseAuth();
+    for (const src of FB_SDK) await loadScript(src);
+    return firebase.initializeApp({ apiKey: fb.apiKey, authDomain: fb.authDomain, projectId: fb.projectId });
+  })();
+  fbPromise.catch(() => { fbPromise = null; });
+  return fbPromise;
+}
+
+function firebaseErrorText(e) {
+  const code = e && e.code ? String(e.code) : '';
+  if (code === 'ep-popup-blocked') return 'Браузер заблокував вікно входу — дозвольте спливаючі вікна для цього сайту';
+  if (code === 'auth/popup-blocked') return 'Браузер заблокував вікно входу — дозвольте спливаючі вікна';
+  if (code === 'auth/popup-closed-by-user') return 'Вхід скасовано';
+  if (code === 'auth/unauthorized-domain') return 'Домен не авторизований у Firebase-проєкті коледжу';
+  if (code === 'auth/network-request-failed') return 'Немає звʼязку з сервером авторизації';
+  return 'Не вдалося увійти через Google';
+}
+
+async function signInWithGoogle() {
+  const btn = $('fbSignIn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Вхід…'; }
   try {
+    await firebaseApp();
+    const provider = new firebase.auth.GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    const cred = await firebase.auth().signInWithPopup(provider);
+    const idToken = cred && cred.credential ? cred.credential.idToken : null;
+    const user = firebase.auth().currentUser;
+    if (!idToken) throw new Error('no token');
     const res = await fetch('/api/auth', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ idToken: response.credential }),
+      body: JSON.stringify({ idToken, refreshToken: user ? user.refreshToken : null }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -446,15 +515,18 @@ async function handleGoogleCredential(response) {
     toast('Вхід виконано');
     renderJournal();
   } catch (e) {
-    toast('Помилка входу', 'err');
+    toast(firebaseErrorText(e), 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Увійти через Google'; }
   }
 }
 
 function journalHead() {
   if (!state.token) {
     return '<div class="card"><b>Журнал потребує входу</b>' +
-      '<div class="muted small" style="margin-top:6px">Коледж закрив публічний доступ до журналів: тепер їх віддає лише кабінет коледжу — для акаунтів @sclnau.com.ua. Увійдіть своїм акаунтом, і журнал та сповіщення про нові оцінки запрацюють.</div>' +
-      '<div id="gSignIn" style="display:flex;justify-content:center;margin-top:14px"></div></div>';
+      '<div class="muted small" style="margin-top:6px">Кабінет коледжу віддає журнал лише акаунтам @sclnau.com.ua. Увійдіть своїм акаунтом Google — журнал і сповіщення про нові оцінки запрацюють.</div>' +
+      '<div id="gSignIn" style="display:flex;justify-content:center;margin-top:14px">' +
+      '<button id="fbSignIn" class="btn">Увійти через Google</button></div></div>';
   }
   return '<div class="row" style="align-items:center;margin-bottom:0">' +
     '<span class="muted small" id="whoami">' + esc(state.email || 'Ви увійшли') + '</span>' +
@@ -473,7 +545,8 @@ async function renderJournal() {
     if (state.token) {
       $('logoutBtn').onclick = async () => { await logout(); renderJournal(); };
     } else {
-      setupGoogleSignIn($('gSignIn'));
+      $('fbSignIn').onclick = signInWithGoogle;
+      firebaseApp().catch(() => { });
     }
   }
   if (!state.token) {
