@@ -12,7 +12,7 @@ import { b64uDecode, b64uEncode } from '../webpush.mjs';
 
 const PORT = 8791;
 const WORKER_PORT = 8792;
-const JOURNAL_PORT = 8795;
+const API_PORT = 8795;
 const PERSIST = '.wrangler/test-state';
 const VAPID_PUBLIC_KEY = 'BD9WRsrpsAahSZYjE3IOWnJCUpzY0l0jV_-HD6pyAwTz0uZSUnewbMc9N-JvMy3lRBc-TOoW4H-zzxLT2RSAd3o';
 const ENDPOINT = 'http://localhost:' + PORT + '/push/test-1';
@@ -91,51 +91,58 @@ const server = createServer((req, res) => {
 });
 await new Promise((r) => server.listen(PORT, r));
 
-// --- «журнал коледжу»: mock замість справжнього сервера ---
-// Справжній journal API періодично лежить (525), тож тест не має від нього
-// залежати: інакше падає не код, а доступність чужого сервера.
-const journal = createServer((req, res) => {
+// --- «кабінет коледжу» і Firebase: mock замість справжніх серверів ---
+// Кабінет коледжу (tt-api) живий і лежить рідко, а Firebase — сторонній сервіс,
+// тож тест не має від них залежати: інакше падає не код, а доступність чужих серверів.
+const api = createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
-  const q = url.searchParams;
-  const known = q.get('group') === 'Т-11'
-    && q.get('last_name') === 'Резніченко'
-    && q.get('first_name') === 'Андрій';
-  if (!known) {
-    res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ detail: 'Student not found in the specified group' }));
+  const json = (code, body) => {
+    res.writeHead(code, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+  if (url.pathname === '/v1/accounts:refresh') {
+    json(200, { id_token: 'test-id-token', refresh_token: 'test-refresh', expires_in: 3600 });
     return;
   }
-  res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({
-    student_id: 3142,
-    group: 'Т-11',
-    last_name: 'Резніченко',
-    first_name: 'Андрій',
-    journal: [
-      {
-        discipline_id: 3,
-        discipline: 'Математика',
-        teacher: 'Викладач',
-        sessions: [
-          {
-            date: '2026-10-12',
-            pair_number: 1,
-            entries: [
-              { kind: 'lesson', number: '1', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: { value: '9', comment: '' } },
-              { kind: 'lesson', number: '2', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: null },
-            ],
-          },
-        ],
-      },
-    ],
-  }));
+  if (url.pathname === '/admin/auth/config') {
+    json(200, { google_client_id: 'test.apps.googleusercontent.com', workspace_domain: 'sclnau.com.ua' });
+    return;
+  }
+  if (url.pathname === '/journal/me') {
+    if (!(req.headers.authorization || '').startsWith('Bearer ')) {
+      json(401, { detail: 'Missing authorization credentials' });
+      return;
+    }
+    json(200, {
+      journal: [
+        {
+          discipline_id: 3,
+          discipline: 'Математика',
+          teacher: 'Викладач',
+          sessions: [
+            {
+              date: '2026-10-12',
+              pair_number: 1,
+              entries: [
+                { kind: 'lesson', number: '1', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: { value: '9', comment: '' } },
+                { kind: 'lesson', number: '2', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: null },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    return;
+  }
+  json(404, { detail: 'Not Found' });
 });
-await new Promise((r) => journal.listen(JOURNAL_PORT, r));
+await new Promise((r) => api.listen(API_PORT, r));
 
 const cwd = fileURLToPath(new URL('..', import.meta.url));
 const WRANGLER = 'node_modules/wrangler/bin/wrangler.js';
 const worker = spawn(process.execPath, [WRANGLER, 'dev', '--port', String(WORKER_PORT), '--test-scheduled', '--local', '--persist-to', PERSIST,
-  '--var', 'JOURNAL_API_URL:http://localhost:' + JOURNAL_PORT + '/api/v1'], {
+  '--var', 'TT_API_URL:http://localhost:' + API_PORT,
+  '--var', 'FIREBASE_API_URL:http://localhost:' + API_PORT], {
   cwd,
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -179,9 +186,8 @@ try {
     headers: { 'content-type': 'application/json', origin: base },
     body: JSON.stringify({
       subscription: { endpoint: ENDPOINT, keys: { p256dh: b64uEncode(uaPublicRaw), auth: authSecret } },
-      group: 'Т-11',
-      lastName: 'Резніченко',
-      firstName: 'Андрій',
+      refreshToken: 'test-refresh',
+      email: 'student@sclnau.com.ua',
     }),
   });
   check('POST /api/push/subscribe', subRes.status, 200);
@@ -237,7 +243,7 @@ try {
 } finally {
   worker.kill();
   server.close();
-  journal.close();
+  api.close();
   console.log(failed ? '\n' + failed + ' перевірок впало' : '\nУсі перевірки пройдено');
   process.exit(failed ? 1 : 0);
 }

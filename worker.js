@@ -9,24 +9,31 @@ import appleIcon from './apple-touch-icon.png';
 import { encryptPush, generateEcdhKeyPair, signVapidJwt, b64uDecode } from './webpush.mjs';
 
 const TT = 'https://tt.sclnau.com.ua';
-const JOURNAL_API = 'https://journal-api.sclnau.com.ua/api/v1';
+const TT_API = 'https://tt-api.sclnau.com.ua';
 
-// JOURNAL_API_URL — перевизначення бази журнального API для локальних тестів (mock у test/push.e2e.mjs).
-function journalApiBase(env) {
-  return (env && env.JOURNAL_API_URL) || JOURNAL_API;
-}
-
-// TT_API_URL — те саме для розкладу та списку груп.
-function ttBase(env) {
-  return (env && env.TT_API_URL) || TT;
-}
+// Firebase-проєкт коледжу. Ці ідентифікатори публічні за своєю природою: ті самі,
+// що вбудовані в офіційний застосунок EduPulse (Google OAuth-клієнт і web-ключ
+// Firebase). Єдиний секрет у проекті — приватний ключ VAPID.
+const GOOGLE_CLIENT_ID = '510124052044-i8hhrh7s4ijmfn0jstm2hktghp94pvup.apps.googleusercontent.com';
+const FIREBASE_API_KEY = 'AIzaSyD2QDru_xQHFAZ1rad97jnUi-DEcnTR0Rw';
+const WORKSPACE_DOMAIN = 'sclnau.com.ua';
 const WP = 'https://sclnau.com.ua/wp-json/wp/v2';
 
-// Ключ Journal API. Публічний за своєю природою: той самий, що вбудований у мобільний
-// додаток коледжу, і доступний кожному, хто встановив застосунок.
-// Тому лежить у відкритому коді — це не витік. Якщо все ж захочеш сховати його,
-// задайте JOURNAL_API_TOKEN (wrangler secret): він матиме пріоритет.
-const PUBLIC_JOURNAL_TOKEN = 'Wx8zMVFSWqDbCwYrEhX66rYCtThPeuxHPC11SzY6Q0BDcdRycm5ta6KFrV7WcsAJ';
+// TT_URL — перевизначення бази старого PHP-сайту для локальних тестів.
+function ttPhpBase(env) {
+  return (env && env.TT_URL) || TT;
+}
+
+// TT_API_URL — перевизначення бази кабінету коледжу (mock у test/push.e2e.mjs).
+function ttApiBase(env) {
+  return (env && env.TT_API_URL) || TT_API;
+}
+
+// FIREBASE_API_URL — те саме для Firebase.
+function firebaseBase(env) {
+  return (env && env.FIREBASE_API_URL) || 'https://identitytoolkit.googleapis.com';
+}
+
 
 // Публічний ключ VAPID — він і так роздається браузерам. Приватний лежить у секреті
 // воркера (VAPID_PRIVATE_KEY), його генерує scripts/gen-vapid-keys.mjs.
@@ -107,6 +114,112 @@ function assetHeaders(contentType, url) {
   };
 }
 
+// --- Вхід через Google (Firebase) ---
+
+let authConfig = null;
+
+async function getAuthConfig(env) {
+  if (authConfig) return authConfig;
+  try {
+    const res = await fetch(ttApiBase(env) + '/admin/auth/config');
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.workspace_domain) authConfig = data;
+    }
+  } catch (e) { }
+  if (!authConfig) authConfig = { google_client_id: GOOGLE_CLIENT_ID, workspace_domain: WORKSPACE_DOMAIN };
+  return authConfig;
+}
+
+// Google-токен -> сесія Firebase. requestUri має належати Firebase-проєкту коледжу.
+async function firebaseExchange(env, idToken, requestUri) {
+  const postBody = new URLSearchParams({ id_token: idToken, providerId: 'google.com' }).toString();
+  return fetch(firebaseBase(env) + '/v1/accounts:signInWithIdp?key=' + FIREBASE_API_KEY, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ postBody, requestUri, returnIdpCredential: true, returnSecureToken: true }),
+  });
+}
+
+// Оновлення сесії: refresh-токен -> новий id-токен (живе до години).
+async function firebaseRefresh(env, refreshToken) {
+  return fetch(firebaseBase(env) + '/v1/accounts:refresh?key=' + FIREBASE_API_KEY, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+  });
+}
+
+// --- Журнал ---
+//
+// Кабінет коледжу (tt-api) не описує формат відповіді в OpenAPI, тож приводимо її
+// до стабільної структури {journal: [...]}, яку вже вміє малювати застосунок.
+
+function firstArray(obj, keys) {
+  if (Array.isArray(obj)) return obj;
+  if (!obj || typeof obj !== 'object') return [];
+  for (const k of keys) if (Array.isArray(obj[k])) return obj[k];
+  return [];
+}
+
+function markValue(entry) {
+  const raw = entry.mark !== undefined ? entry.mark : entry.mark_value;
+  if (raw !== null && raw !== undefined && typeof raw === 'object') {
+    const v = raw.value !== undefined ? raw.value : raw.mark;
+    return v === null || v === undefined || v === '' ? null : { value: String(v), comment: raw.comment || '' };
+  }
+  const v = raw !== undefined && raw !== null ? raw
+    : entry.value !== undefined ? entry.value
+    : entry.grade !== undefined ? entry.grade : null;
+  return v === null || v === undefined || v === '' ? null : { value: String(v), comment: '' };
+}
+
+function normalizeJournal(data) {
+  const disciplines = firstArray(data, ['journal', 'disciplines', 'subjects', 'items']);
+  return {
+    journal: disciplines.map((d) => {
+      let sessions = firstArray(d, ['sessions', 'lessons', 'classes']);
+      // Плоска структура: предмет одразу містить записи без обгортки «заняття».
+      if (!sessions.length) {
+        const flat = firstArray(d, ['entries', 'marks', 'records']);
+        if (flat.length) sessions = [{ date: d.date || '', entries: flat }];
+      }
+      return {
+        discipline_id: d.discipline_id !== undefined ? d.discipline_id : (d.id !== undefined ? d.id : null),
+        discipline: d.discipline || d.discipline_name || d.name || d.title || 'Предмет',
+        teacher: d.teacher || d.teacher_name || d.teacher_full_name || '',
+        sessions: sessions.map((s) => ({
+          date: s.date || s.date_str || s.lesson_date || '',
+          pair_number: s.pair_number !== undefined ? s.pair_number : (s.pair !== undefined ? s.pair : (s.number !== undefined ? s.number : null)),
+          entries: firstArray(s, ['entries', 'marks', 'records']).map((e) => ({
+            number: e.number !== undefined ? e.number : null,
+            kind: e.kind || e.kind_of || 'lesson',
+            type: e.type || e.type_of || e.assessment_type || '',
+            mark: markValue(e),
+            topic: e.topic || '',
+            homework: e.homework || '',
+            self_study: e.self_study || '',
+          })),
+        })),
+      };
+    }),
+  };
+}
+
+// Свой журнал за токеном користувача.
+async function fetchMyJournal(env, token) {
+  try {
+    const res = await fetch(ttApiBase(env) + '/journal/me', {
+      headers: { authorization: 'Bearer ' + token, 'user-agent': 'okhttp/4.12.0' },
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return data ? normalizeJournal(data) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // --- Сповіщення (Web Push) ---
 
 async function sha256Hex(text) {
@@ -125,22 +238,21 @@ async function listKvKeys(kv, prefix) {
   return names;
 }
 
-async function fetchJournalFor(env, sub) {
-  const token = (env && env.JOURNAL_API_TOKEN) || PUBLIC_JOURNAL_TOKEN;
-  const q = new URLSearchParams({
-    group: sub.group,
-    last_name: sub.lastName,
-    first_name: sub.firstName,
-  });
-  try {
-    const res = await fetch(journalApiBase(env) + '/journal/?' + q.toString(), {
-      headers: { 'X-Auth-Token': token, 'user-agent': 'okhttp/4.12.0' },
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (e) {
-    return null;
+// Сесія підписника: id-токен протухає за годину, тож тримаємо в KV і refresh-токен,
+// і оновлений id-токен.
+async function sessionFor(env, sub) {
+  if (sub.idToken && sub.idTokenExpires && sub.idTokenExpires > Date.now() + 60000) {
+    return { token: sub.idToken, refreshToken: sub.refreshToken, changed: false };
   }
+  if (!sub.refreshToken) return null;
+  const res = await firebaseRefresh(env, sub.refreshToken).catch(() => null);
+  if (!res || !res.ok) return null;
+  const data = await res.json().catch(() => null);
+  if (!data || !data.id_token) return null;
+  sub.idToken = data.id_token;
+  sub.idTokenExpires = Date.now() + (Number(data.expires_in || 3600) - 60) * 1000;
+  if (data.refresh_token) sub.refreshToken = data.refresh_token;
+  return { token: sub.idToken, refreshToken: sub.refreshToken, changed: true };
 }
 
 // Карта оцінок журналу: ключ заняття -> підпис його записів.
@@ -297,7 +409,6 @@ export default {
     const url = new URL(request.url);
     const { pathname } = url;
     const origin = url.origin;
-    const journalToken = (env && env.JOURNAL_API_TOKEN) || PUBLIC_JOURNAL_TOKEN;
 
     if (pathname.startsWith('/api/')) {
       const q = url.searchParams.toString();
@@ -319,26 +430,26 @@ export default {
         if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
           return json({ error: 'Invalid subscription' }, 400);
         }
-        const group = String(body.group || '').trim();
-        const lastName = String(body.lastName || '').trim();
-        const firstName = String(body.firstName || '').trim();
-        if (!group || !lastName || !firstName) {
-          return json({ error: 'group, lastName and firstName are required' }, 400);
-        }
+        const refreshToken = String(body.refreshToken || '').trim();
+        if (!refreshToken) return json({ error: 'Sign in required' }, 401);
         const id = await sha256Hex(sub.endpoint);
         const record = {
           endpoint: sub.endpoint,
           p256dh: sub.keys.p256dh,
           auth: sub.keys.auth,
-          group,
-          lastName,
-          firstName,
+          email: String(body.email || '').trim(),
+          refreshToken,
+          idToken: null,
+          idTokenExpires: 0,
           createdAt: Date.now(),
           marks: {},
         };
         // Базовий знімок журналу: щоб перша перевірка не повідомила про всю історію.
-        const journal = await fetchJournalFor(env, record);
-        if (journal) record.marks = pruneMarks(collectMarks(journal).marks);
+        const session = await sessionFor(env, record);
+        if (session) {
+          const journal = await fetchMyJournal(env, session.token);
+          if (journal) record.marks = pruneMarks(collectMarks(journal).marks);
+        }
         await env.PUSH_SUBS.put(PUSH_PREFIX + id, JSON.stringify(record));
         return json({ ok: true, id });
       }
@@ -360,34 +471,97 @@ export default {
       }
 
       if (pathname === '/api/groups') {
-        return passThrough(ttBase(env), '/student/getGroups.php');
+        return passThrough(ttPhpBase(env), '/student/getGroups.php');
       }
       if (pathname === '/api/dates') {
-        return passThrough(TT, '/getScheduleDates.php');
+        return passThrough(ttPhpBase(env), '/getScheduleDates.php');
       }
       if (pathname === '/api/schedule') {
         const p = new URLSearchParams(q);
         if (p.get('date')) p.set('date', toApiDate(p.get('date')));
-        return passThrough(TT, '/student/GetStudent.php' + (p.toString() ? '?' + p.toString() : ''));
+        return passThrough(ttPhpBase(env), '/student/GetStudent.php' + (p.toString() ? '?' + p.toString() : ''));
       }
       if (pathname === '/api/teachers') {
-        return passThrough(TT, '/teacher/getTeacherList.php');
+        return passThrough(ttPhpBase(env), '/teacher/getTeacherList.php');
       }
       if (pathname === '/api/teacher-schedule') {
         const p = new URLSearchParams(q);
         if (p.get('date')) p.set('date', toApiDate(p.get('date')));
-        return passThrough(TT, '/teacher/GetTeacher.php' + (p.toString() ? '?' + p.toString() : ''));
+        return passThrough(ttPhpBase(env), '/teacher/GetTeacher.php' + (p.toString() ? '?' + p.toString() : ''));
       }
       if (pathname === '/api/contacts') {
-        return passThrough(TT, '/others/contacts.json');
+        return passThrough(ttPhpBase(env), '/others/contacts.json');
       }
       if (pathname === '/api/payments') {
-        return passThrough(TT, '/others/payments.json');
+        return passThrough(ttPhpBase(env), '/others/payments.json');
+      }
+      if (pathname === '/api/config') {
+        const cfg = await getAuthConfig(env);
+        return json({
+          googleClientId: cfg.google_client_id || GOOGLE_CLIENT_ID,
+          workspaceDomain: cfg.workspace_domain || WORKSPACE_DOMAIN,
+        });
+      }
+      if (pathname === '/api/auth' && request.method === 'POST') {
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return json({ error: 'Bad request' }, 400);
+        }
+        if (!body || !body.idToken) return json({ error: 'idToken required' }, 400);
+        const cfg = await getAuthConfig(env);
+        const domain = cfg.workspace_domain || WORKSPACE_DOMAIN;
+        const res = await firebaseExchange(env, body.idToken, 'https://' + domain);
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data) {
+          return json({ error: 'Auth failed', details: data && data.error ? data.error.message : null }, res.status || 500);
+        }
+        const email = (data.email || '').toLowerCase();
+        if (!email || !email.endsWith('@' + domain)) {
+          return json({ error: 'Account not allowed', details: 'Доступ лише для акаунтів @' + domain }, 403);
+        }
+        return json({
+          idToken: data.idToken,
+          refreshToken: data.refreshToken,
+          expiresIn: data.expiresIn,
+          email: data.email || null,
+          displayName: data.displayName || null,
+          photoUrl: data.photoUrl || null,
+          localId: data.localId,
+        });
+      }
+      if (pathname === '/api/refresh' && request.method === 'POST') {
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return json({ error: 'Bad request' }, 400);
+        }
+        if (!body || !body.refreshToken) return json({ error: 'refreshToken required' }, 400);
+        const res = await firebaseRefresh(env, body.refreshToken);
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data) return json({ error: 'Refresh failed' }, res.status || 500);
+        return json({
+          idToken: data.id_token,
+          refreshToken: data.refresh_token,
+          expiresIn: data.expires_in,
+          userId: data.user_id,
+        });
       }
       if (pathname === '/api/journal') {
-        return passThrough(journalApiBase(env), '/journal/' + (q ? '?' + q : ''), {
-          headers: { 'X-Auth-Token': journalToken },
+        const auth = request.headers.get('authorization') || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+        if (!token) return json({ error: 'Sign in required' }, 401);
+        const res = await fetch(ttApiBase(env) + '/journal/me', {
+          headers: { authorization: 'Bearer ' + token, 'user-agent': 'okhttp/4.12.0' },
         });
+        if (res.status === 401 || res.status === 403) return json({ error: 'Sign in required' }, 401);
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data) return json({ error: 'Journal unavailable' }, 502);
+        return json(normalizeJournal(data));
       }
       if (pathname === '/api/news') {
         return passThrough(WP, '/posts' + (q ? '?' + q : ''));
@@ -436,14 +610,6 @@ export default {
     if (!names.length) return;
 
     const keyPair = await generateEcdhKeyPair();
-    const journals = new Map();
-
-    // Один і той самий студент у кількох підписках — запит до коледжу робимо один раз.
-    const journalFor = async (sub) => {
-      const key = sub.group + '|' + sub.lastName + '|' + sub.firstName;
-      if (!journals.has(key)) journals.set(key, await fetchJournalFor(env, sub));
-      return journals.get(key);
-    };
 
     for (const name of names) {
       const raw = await env.PUSH_SUBS.get(name);
@@ -455,7 +621,9 @@ export default {
         continue;
       }
       try {
-        const journal = await journalFor(sub);
+        const session = await sessionFor(env, sub);
+        if (!session) continue;
+        const journal = await fetchMyJournal(env, session.token);
         if (!journal) continue;
         const res = await checkSubscription(env, sub, keyPair, journal);
         if (res.dead) {
@@ -464,7 +632,7 @@ export default {
         }
         // Пишемо в KV лише коли знімок справді змінився: безкоштовний
         // тариф дає 1000 записів на добу, а хронологія бігає двічі на годину.
-        if (res.changed) await env.PUSH_SUBS.put(name, JSON.stringify(sub));
+        if (res.changed || session.changed) await env.PUSH_SUBS.put(name, JSON.stringify(sub));
       } catch (e) { }
     }
   },

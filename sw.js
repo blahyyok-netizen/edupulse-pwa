@@ -66,9 +66,10 @@ self.addEventListener('notificationclick', (e) => {
   );
 });
 
-// Помилки не кешуємо.
-function cacheable(res) {
+// Помилки не кешуємо. Відповіді з авторизацією — теж.
+function cacheable(res, req) {
   if (!res || !res.ok) return false;
+  if (req && req.headers && req.headers.get('authorization')) return false;
   const cc = res.headers.get('cache-control') || '';
   if (/no-store|private/i.test(cc)) return false;
   return true;
@@ -97,7 +98,7 @@ self.addEventListener('fetch', (e) => {
     e.respondWith(
       fetch(req)
         .then((res) => {
-          if (cacheable(res)) {
+          if (cacheable(res, req)) {
             const copy = res.clone();
             caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
           }
@@ -126,7 +127,7 @@ self.addEventListener('fetch', (e) => {
 
   e.respondWith(
     caches.match(req).then((cached) => cached || fetch(req).then((res) => {
-      if (cacheable(res)) {
+      if (cacheable(res, req)) {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
       }

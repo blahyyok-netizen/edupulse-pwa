@@ -3,9 +3,9 @@ const LS = {
   group: 'ep_group', theme: 'ep_theme',
   mode: 'ep_mode', teacher: 'ep_teacher',
   lastName: 'ep_lastname', firstName: 'ep_firstname',
-  pushCreds: 'ep_push_creds',
+  token: 'ep_token', refresh: 'ep_refresh', expires: 'ep_expires', email: 'ep_email',
   sched: (k, d) => 'ep_sched_' + k + '_' + d,
-  journal: (k) => 'ep_journal_' + k,
+  journal: 'ep_journal',
 };
 
 const TTL = {
@@ -26,6 +26,10 @@ const state = {
   availableDates: [],
   calY: null,
   calM: null,
+  token: localStorage.getItem(LS.token) || null,
+  refreshToken: localStorage.getItem(LS.refresh) || null,
+  expiresAt: Number(localStorage.getItem(LS.expires) || 0),
+  email: localStorage.getItem(LS.email) || '',
 };
 
 function readJson(key, fallback) {
@@ -57,8 +61,55 @@ function cacheGet(key, ttl) {
   }
 }
 
+function saveAuth(data) {
+  state.token = data.idToken;
+  state.refreshToken = data.refreshToken || state.refreshToken;
+  state.expiresAt = Date.now() + (Number(data.expiresIn || 3600) - 60) * 1000;
+  state.email = data.email || state.email;
+  localStorage.setItem(LS.token, state.token);
+  localStorage.setItem(LS.refresh, state.refreshToken || '');
+  localStorage.setItem(LS.expires, String(state.expiresAt));
+  if (data.email) localStorage.setItem(LS.email, data.email);
+}
+
+async function logout() {
+  const endpoint = push.subscription && push.subscription.endpoint;
+  if (endpoint) {
+    await fetch('/api/push/unsubscribe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ endpoint }),
+    }).catch(() => null);
+  }
+  [LS.token, LS.refresh, LS.expires, LS.email, LS.journal].forEach((k) => localStorage.removeItem(k));
+  state.token = null;
+  state.refreshToken = null;
+  state.expiresAt = 0;
+  state.email = '';
+}
+
 async function api(path, opts = {}) {
-  return fetch(path, opts);
+  const doFetch = () => fetch(path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), ...(state.token ? { authorization: 'Bearer ' + state.token } : {}) },
+  });
+  let res = await doFetch();
+  if (res.status === 401 && state.refreshToken) {
+    try {
+      const r = await fetch('/api/refresh', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ refreshToken: state.refreshToken }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        saveAuth(d);
+        res = await doFetch();
+      } else if (r.status === 400) {
+        await logout();
+      }
+    } catch (e) { }
+  }
+  return res;
 }
 
 async function apiJson(path, opts) {
@@ -345,69 +396,121 @@ function drawSchedule(data, fromCache) {
   }
 }
 
-async function renderJournal() {
-  const el = $('journalList');
-  const group = localStorage.getItem(LS.group) || '';
-  const first = localStorage.getItem(LS.firstName) || '';
-  const last = localStorage.getItem(LS.lastName) || '';
-
-  const head = $('journalHead');
-  if (!head.dataset.ready) {
-    head.innerHTML =
-      '<div class="row"><input id="jGroup" class="input" placeholder="Група" value="' + esc(group) + '"></div>' +
-      '<div class="row"><input id="jLast" class="input" placeholder="Прізвище" value="' + esc(last) + '"><input id="jFirst" class="input" placeholder="Ім\'я" value="' + esc(first) + '"></div>' +
-      '<button id="jGo" class="btn block">Показати журнал</button>' +
-      '<div class="muted small" style="margin-top:8px">Журнал відкривається без входу — дані з сервера коледжу.</div>' +
-      '<div class="row" style="margin-top:16px;margin-bottom:0"><button id="pushBtn" class="btn ghost block">🔔 Увімкнути сповіщення</button></div>' +
-      '<div class="muted small" id="pushHint" style="margin-top:6px"></div>';
-    head.dataset.ready = '1';
-    $('jGroup').oninput = () => { localStorage.setItem(LS.group, $('jGroup').value); drawPushRow(); };
-    $('jLast').oninput = () => { localStorage.setItem(LS.lastName, $('jLast').value); drawPushRow(); };
-    $('jFirst').oninput = () => { localStorage.setItem(LS.firstName, $('jFirst').value); drawPushRow(); };
-    $('jGo').onclick = () => {
-      localStorage.setItem(LS.group, $('jGroup').value);
-      localStorage.setItem(LS.lastName, $('jLast').value);
-      localStorage.setItem(LS.firstName, $('jFirst').value);
-      fetchJournal($('jGroup').value.trim(), $('jLast').value.trim(), $('jFirst').value.trim());
-    };
-    $('pushBtn').onclick = () => (push.subscription ? disablePush() : enablePush());
-  } else {
-    $('jGroup').value = group;
-    if (last) $('jLast').value = last;
-    if (first) $('jFirst').value = first;
-  }
-
-  refreshPushState();
-
-  const g = $('jGroup').value.trim();
-  const l = $('jLast').value.trim();
-  const f = $('jFirst').value.trim();
-  if (g && l && f) fetchJournal(g, l, f);
-  else empty(el, 'Заповни групу та ПІБ');
+function loadGis() {
+  if (window.google && window.google.accounts && window.google.accounts.id) return Promise.resolve(true);
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true; s.defer = true;
+    s.onload = () => resolve(true);
+    s.onerror = () => reject(new Error('gis'));
+    document.head.appendChild(s);
+  });
 }
 
-async function fetchJournal(group, last, first) {
+async function setupGoogleSignIn(host) {
+  try {
+    const cfg = await apiJson('/api/config');
+    if (!cfg.googleClientId) throw new Error('no client id');
+    await loadGis();
+    window.google.accounts.id.initialize({
+      client_id: cfg.googleClientId,
+      callback: handleGoogleCredential,
+      ux_mode: 'popup',
+    });
+    window.google.accounts.id.renderButton(host, {
+      theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'filled_black' : 'outline',
+      size: 'large',
+      shape: 'pill',
+      width: 260,
+      text: 'continue_with',
+    });
+  } catch (e) {
+    host.innerHTML = '<div class="muted small">Кнопку входу не вдалося завантажити. Спробуйте пізніше.</div>';
+  }
+}
+
+async function handleGoogleCredential(response) {
+  if (!response || !response.credential) return;
+  try {
+    const res = await fetch('/api/auth', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ idToken: response.credential }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast(data.error === 'Account not allowed' ? 'Доступ лише для акаунтів @sclnau.com.ua' : (data.error || 'Не вдалося увійти'), 'err');
+      return;
+    }
+    saveAuth(data);
+    toast('Вхід виконано');
+    renderJournal();
+  } catch (e) {
+    toast('Помилка входу', 'err');
+  }
+}
+
+function journalHead() {
+  if (!state.token) {
+    return '<div class="card"><b>Журнал потребує входу</b>' +
+      '<div class="muted small" style="margin-top:6px">Коледж закрив публічний доступ до журналів: тепер їх віддає лише кабінет коледжу — для акаунтів @sclnau.com.ua. Увійдіть своїм акаунтом, і журнал та сповіщення про нові оцінки запрацюють.</div>' +
+      '<div id="gSignIn" style="display:flex;justify-content:center;margin-top:14px"></div></div>';
+  }
+  return '<div class="row" style="align-items:center;margin-bottom:0">' +
+    '<span class="muted small" id="whoami">' + esc(state.email || 'Ви увійшли') + '</span>' +
+    '<button id="logoutBtn" class="btn ghost small-btn" style="margin-left:auto">Вийти</button></div>' +
+    '<div class="row" style="margin-top:16px;margin-bottom:0"><button id="pushBtn" class="btn ghost block">🔔 Увімкнути сповіщення</button></div>' +
+    '<div class="muted small" id="pushHint" style="margin-top:6px"></div>';
+}
+
+async function renderJournal() {
   const el = $('journalList');
-  if (!group || !last || !first) { empty(el, 'Потрібні група, прізвище та ім\'я'); return; }
-  const key = LS.journal(group + '_' + last + '_' + first);
+  const head = $('journalHead');
+  const mode = state.token ? 'in' : 'out';
+  if (head.dataset.mode !== mode) {
+    head.innerHTML = journalHead();
+    head.dataset.mode = mode;
+    if (state.token) {
+      $('logoutBtn').onclick = async () => { await logout(); renderJournal(); };
+    } else {
+      setupGoogleSignIn($('gSignIn'));
+    }
+  }
+  if (!state.token) {
+    empty(el, 'Увійдіть, щоб побачити свій журнал');
+    return;
+  }
+  refreshPushState();
+  fetchJournal();
+}
+
+async function fetchJournal() {
+  const el = $('journalList');
+  const key = LS.journal;
   const cached = cacheGet(key, TTL.journal);
   if (!navigator.onLine && cached) { drawJournal(cached, true); return; }
   loader(el);
   let data = null;
   try {
-    const res = await api('/api/journal?group=' + encodeURIComponent(group) + '&last_name=' + encodeURIComponent(last) + '&first_name=' + encodeURIComponent(first));
-    if (res.ok) { data = cacheSet(key, await res.json(), TTL.journal); }
+    const res = await api('/api/journal');
+    if (res.ok) {
+      data = cacheSet(key, await res.json(), TTL.journal);
+    } else if (res.status === 401) {
+      await logout();
+      empty(el, 'Сесія завершилась. Увійдіть знову.');
+      renderJournal();
+      return;
+    }
   } catch (e) { }
   if (!data && cached) data = cached;
   if (!data) { empty(el, 'Не вдалося завантажити журнал'); return; }
   drawJournal(data, false);
-  syncPushCreds();
 }
 
 function drawJournal(data, fromCache) {
   const el = $('journalList');
   const subjects = (data && Array.isArray(data.journal)) ? data.journal : [];
-  if (!subjects.length) { empty(el, 'Журнал порожній (перевір групу та ПІБ)'); return; }
+  if (!subjects.length) { empty(el, 'Журнал порожній'); return; }
   el.innerHTML = subjects.map((s, i) => {
     const sessions = Array.isArray(s.sessions) ? s.sessions : [];
     const marks = [];
@@ -447,18 +550,6 @@ function b64ToBytes(base64) {
   return out;
 }
 
-function journalCreds() {
-  const val = (id, key) => {
-    const el = $(id);
-    return (el && el.value.trim()) || localStorage.getItem(key) || '';
-  };
-  return {
-    group: val('jGroup', LS.group),
-    lastName: val('jLast', LS.lastName),
-    firstName: val('jFirst', LS.firstName),
-  };
-}
-
 function isStandalone() {
   return matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 }
@@ -494,12 +585,11 @@ function drawPushRow() {
     pushHint('Дозвіл на сповіщення можна повернути в налаштуваннях сайту в браузері.');
     return;
   }
-  const creds = journalCreds();
-  const ready = creds.group && creds.lastName && creds.firstName;
+  const ready = !!state.token;
   btn.disabled = !ready && !push.subscription;
   btn.textContent = push.subscription ? '🔕 Вимкнути сповіщення' : '🔔 Увімкнути сповіщення';
   if (!ready) {
-    pushHint('Спершу вкажіть групу та ПІБ — інакше немає кого перевіряти в журналі.');
+    pushHint('Спершу увійдіть — інакше немає кого перевіряти в журналі.');
   } else {
     pushHint('Сповіщення приходять, коли в журналі з’явиться нова оцінка. Журнал перевіряється двічі на годину.');
   }
@@ -522,28 +612,25 @@ async function refreshPushState() {
   drawPushRow();
 }
 
-async function sendPushSubscription(sub, creds) {
+async function sendPushSubscription(sub) {
   const res = await fetch('/api/push/subscribe', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       subscription: { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth } },
-      group: creds.group,
-      lastName: creds.lastName,
-      firstName: creds.firstName,
+      refreshToken: state.refreshToken,
+      email: state.email,
     }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error || ('HTTP ' + res.status));
   }
-  localStorage.setItem(LS.pushCreds, JSON.stringify(creds));
 }
 
 async function enablePush() {
-  const creds = journalCreds();
-  if (!creds.group || !creds.lastName || !creds.firstName) {
-    toast('Спершу вкажіть групу та ПІБ', 'err');
+  if (!state.token || !state.refreshToken) {
+    toast('Спершу увійдіть', 'err');
     return;
   }
   const btn = $('pushBtn');
@@ -566,7 +653,7 @@ async function enablePush() {
       });
     }
     push.subscription = sub;
-    await sendPushSubscription(sub, creds);
+    await sendPushSubscription(sub);
     toast('Сповіщення увімкнено');
   } catch (e) {
     toast('Не вдалося увімкнути сповіщення: ' + (e.message || e), 'err');
@@ -586,24 +673,11 @@ async function disablePush() {
       await sub.unsubscribe();
     }
     push.subscription = null;
-    localStorage.removeItem(LS.pushCreds);
     toast('Сповіщення вимкнено');
   } catch (e) {
     toast('Не вдалося вимкнути сповіщення', 'err');
   }
   drawPushRow();
-}
-
-// Якщо підписка вже є, а студент змінився — оновлюємо дані на сервері.
-async function syncPushCreds() {
-  if (!push.subscription) return;
-  const creds = journalCreds();
-  if (!creds.group || !creds.lastName || !creds.firstName) return;
-  const saved = readJson(LS.pushCreds, null);
-  if (saved && saved.group === creds.group && saved.lastName === creds.lastName && saved.firstName === creds.firstName) return;
-  try {
-    await sendPushSubscription(push.subscription, creds);
-  } catch (e) { }
 }
 
 async function renderNews() {
@@ -711,7 +785,27 @@ function drawPayments(data) {
   });
 }
 
+function renderPayWho() {
+  const el = $('payWho');
+  if (!el) return;
+  const g = localStorage.getItem(LS.group) || '';
+  const l = localStorage.getItem(LS.lastName) || '';
+  const f = localStorage.getItem(LS.firstName) || '';
+  el.innerHTML =
+    '<div class="section-title" style="margin-top:0">Дані для призначення платежу</div>' +
+    '<div class="row"><input id="pGroup" class="input" placeholder="Група" value="' + esc(g) + '"></div>' +
+    '<div class="row"><input id="pLast" class="input" placeholder="Прізвище" value="' + esc(l) + '"><input id="pFirst" class="input" placeholder="Ім\'я" value="' + esc(f) + '"></div>';
+  const save = () => {
+    localStorage.setItem(LS.group, $('pGroup').value.trim());
+    localStorage.setItem(LS.lastName, $('pLast').value.trim());
+    localStorage.setItem(LS.firstName, $('pFirst').value.trim());
+    if (state.payments) drawPayments(state.payments);
+  };
+  ['pGroup', 'pLast', 'pFirst'].forEach((id) => { $(id).oninput = save; });
+}
+
 function renderMore() {
+  renderPayWho();
   renderContacts();
   renderPayments();
 }

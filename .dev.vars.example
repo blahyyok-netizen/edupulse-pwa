@@ -2,12 +2,13 @@
 # Скопіюйте цей файл у .dev.vars і підставте свої значення.
 # Файл .dev.vars у .gitignore — у репозиторій не потрапляє.
 
-# Токен до Journal API коледжу.
-# Якщо задати тут — він матиме пріоритет над токеном у worker.js.
-JOURNAL_API_TOKEN=
-
 # Приватний ключ VAPID для web push (base64url, 32 байти).
 # Згенерувати пару: npm run vapid:gen
 # У production цей ключ треба покласти в секрет воркера:
 #   npx wrangler secret put VAPID_PRIVATE_KEY
 VAPID_PRIVATE_KEY=
+
+# Необов'язково: адреси серверів для локальних тестів.
+# За замовчуванням воркер ходить на справжні сервери коледжу.
+# TT_API_URL=https://tt-api.sclnau.com.ua
+# FIREBASE_API_URL=https://identitytoolkit.googleapis.com
