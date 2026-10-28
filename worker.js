@@ -18,6 +18,7 @@ const GOOGLE_CLIENT_ID = '510124052044-i8hhrh7s4ijmfn0jstm2hktghp94pvup.apps.goo
 const FIREBASE_API_KEY = 'AIzaSyD2QDru_xQHFAZ1rad97jnUi-DEcnTR0Rw';
 const FIREBASE_AUTH_DOMAIN = 'edupulse-main.firebaseapp.com';
 const FIREBASE_PROJECT_ID = 'edupulse-main';
+const FIREBASE_APP_NAME = '[DEFAULT]';
 const WORKSPACE_DOMAIN = 'sclnau.com.ua';
 const WP = 'https://sclnau.com.ua/wp-json/wp/v2';
 
@@ -166,6 +167,32 @@ async function firebaseRefresh(env, refreshToken) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken }),
   });
+}
+
+// Обмін коду, який Google віддав на зворотному адресі, на токен Firebase-проєкту
+// коледжу. Так само робить Firebase SDK: postBody — це «code=…&providerId=…»,
+// requestUri — адреса, на яку Google повернув код.
+async function firebaseSignInWithIdp(env, postBody, requestUri, sessionId) {
+  const payload = {
+    postBody,
+    requestUri: requestUri || ('https://' + FIREBASE_AUTH_DOMAIN + '/__/auth/handler'),
+    returnSecureToken: true,
+    returnIdpCredential: true,
+  };
+  if (sessionId) payload.sessionId = sessionId;
+  const res = await fetch(firebaseBase(env) + '/v1/accounts:signInWithIdp?key=' + FIREBASE_API_KEY, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const data = await res.json().catch(() => null);
+  if (!data || !data.idToken) return null;
+  return {
+    idToken: data.idToken,
+    refreshToken: data.refreshToken || null,
+    expiresIn: Number(data.expiresIn || 3600),
+  };
 }
 
 // --- Журнал ---
@@ -436,20 +463,20 @@ export default {
       }
 
       if (pathname === '/api/push/subscribe' && request.method === 'POST') {
-        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-        if (!env.PUSH_SUBS) return json({ error: 'Push is not configured' }, 503);
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed', details: 'Запит не з нашого домену' }, 403);
+        if (!env.PUSH_SUBS) return json({ error: 'Push is not configured', details: 'Сповіщення не налаштовані' }, 503);
         let body;
         try {
           body = await request.json();
         } catch {
-          return json({ error: 'Bad request' }, 400);
+          return json({ error: 'Bad request', details: 'Некоректний запит' }, 400);
         }
         const sub = body && body.subscription;
         if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
-          return json({ error: 'Invalid subscription' }, 400);
+          return json({ error: 'Invalid subscription', details: 'Підписка некоректна' }, 400);
         }
         const refreshToken = String(body.refreshToken || '').trim();
-        if (!refreshToken) return json({ error: 'Sign in required' }, 401);
+        if (!refreshToken) return json({ error: 'Sign in required', details: 'Спершу увійдіть' }, 401);
         const id = await sha256Hex(sub.endpoint);
         const record = {
           endpoint: sub.endpoint,
@@ -473,16 +500,16 @@ export default {
       }
 
       if (pathname === '/api/push/unsubscribe' && request.method === 'POST') {
-        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
-        if (!env.PUSH_SUBS) return json({ error: 'Push is not configured' }, 503);
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed', details: 'Запит не з нашого домену' }, 403);
+        if (!env.PUSH_SUBS) return json({ error: 'Push is not configured', details: 'Сповіщення не налаштовані' }, 503);
         let body;
         try {
           body = await request.json();
         } catch {
-          return json({ error: 'Bad request' }, 400);
+          return json({ error: 'Bad request', details: 'Некоректний запит' }, 400);
         }
         const endpoint = body && body.endpoint;
-        if (!endpoint) return json({ error: 'endpoint required' }, 400);
+        if (!endpoint) return json({ error: 'endpoint required', details: 'Не вказано підписку' }, 400);
         const id = await sha256Hex(endpoint);
         await env.PUSH_SUBS.delete(PUSH_PREFIX + id);
         return json({ ok: true });
@@ -520,37 +547,53 @@ export default {
             apiKey: FIREBASE_API_KEY,
             authDomain: FIREBASE_AUTH_DOMAIN,
             projectId: FIREBASE_PROJECT_ID,
+            appName: FIREBASE_APP_NAME,
+            handlerOrigin: 'https://' + FIREBASE_AUTH_DOMAIN,
           },
           workspaceDomain: cfg.workspace_domain || WORKSPACE_DOMAIN,
         });
       }
       if (pathname === '/api/auth' && request.method === 'POST') {
-        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed', details: 'Запит не з нашого домену' }, 403);
         let body;
         try {
           body = await request.json();
         } catch {
-          return json({ error: 'Bad request' }, 400);
+          return json({ error: 'Bad request', details: 'Некоректний запит' }, 400);
         }
-        if (!body || !body.idToken) return json({ error: 'idToken required' }, 400);
+        if (!body) return json({ error: 'Bad request', details: 'Некоректний запит' }, 400);
+
+        // Google повернув код на callback Firebase-обробника — міняємо його на
+        // токен проєкту коледжу (те саме робить Firebase SDK).
+        let idToken = body.idToken || null;
+        let refreshToken = body.refreshToken || null;
+        let expiresIn = 0;
+        if (!idToken && body.postBody) {
+          const exchanged = await firebaseSignInWithIdp(env, body.postBody, body.urlResponse, body.sessionId);
+          if (!exchanged) return json({ error: 'Auth failed', details: 'Не вдалося обміняти код на токен' }, 401);
+          idToken = exchanged.idToken;
+          refreshToken = exchanged.refreshToken;
+          expiresIn = exchanged.expiresIn;
+        }
+        if (!idToken) return json({ error: 'idToken required', details: 'Немає токена входу' }, 400);
         // Токен випустив Firebase-проєкт коледжу — той самий, що й в офіційному
         // застосунку. Кабінет приймає саме такі токени, а кого саме показувати —
         // вирішує вже сам кабінет (він знає, чи це студент, чи батько).
-        const user = await firebaseLookup(env, body.idToken);
+        const user = await firebaseLookup(env, idToken);
         if (!user) return json({ error: 'Auth failed', details: 'Невірний токен' }, 401);
-        const claims = jwtClaims(body.idToken);
+        const claims = jwtClaims(idToken);
         if (claims && claims.aud && claims.aud !== FIREBASE_PROJECT_ID) {
           return json({ error: 'Auth failed', details: 'Токен не від цього проєкту' }, 401);
         }
         const email = (user.email || '').toLowerCase();
         if (!email) return json({ error: 'Auth failed', details: 'Акаунт без пошти' }, 401);
-        const expiresIn = claims && claims.exp
+        const ttl = expiresIn || (claims && claims.exp
           ? Math.max(60, claims.exp - Math.floor(Date.now() / 1000))
-          : 3600;
+          : 3600);
         return json({
-          idToken: body.idToken,
-          refreshToken: body.refreshToken || null,
-          expiresIn,
+          idToken,
+          refreshToken: refreshToken || null,
+          expiresIn: ttl,
           email: user.email || null,
           displayName: user.displayName || null,
           photoUrl: user.photoUrl || null,
@@ -558,17 +601,17 @@ export default {
         });
       }
       if (pathname === '/api/refresh' && request.method === 'POST') {
-        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed' }, 403);
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed', details: 'Запит не з нашого домену' }, 403);
         let body;
         try {
           body = await request.json();
         } catch {
-          return json({ error: 'Bad request' }, 400);
+          return json({ error: 'Bad request', details: 'Некоректний запит' }, 400);
         }
-        if (!body || !body.refreshToken) return json({ error: 'refreshToken required' }, 400);
+        if (!body || !body.refreshToken) return json({ error: 'refreshToken required', details: 'Немає refresh-токена' }, 400);
         const res = await firebaseRefresh(env, body.refreshToken);
         const data = await res.json().catch(() => null);
-        if (!res.ok || !data) return json({ error: 'Refresh failed' }, res.status || 500);
+        if (!res.ok || !data) return json({ error: 'Refresh failed', details: 'Не вдалося оновити сесію' }, res.status || 500);
         return json({
           idToken: data.id_token,
           refreshToken: data.refresh_token,
@@ -579,14 +622,14 @@ export default {
       if (pathname === '/api/journal') {
         const auth = request.headers.get('authorization') || '';
         const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-        if (!token) return json({ error: 'Sign in required' }, 401);
+        if (!token) return json({ error: 'Sign in required', details: 'Спершу увійдіть' }, 401);
         const res = await fetch(ttApiBase(env) + '/journal/me', {
           headers: { authorization: 'Bearer ' + token, 'user-agent': 'okhttp/4.12.0' },
         });
-        if (res.status === 401) return json({ error: 'Sign in required' }, 401);
+        if (res.status === 401) return json({ error: 'Sign in required', details: 'Сесія завершилась — увійдіть знову' }, 401);
         if (res.status === 403) return json({ error: 'Journal not allowed', details: 'Цей акаунт не має доступу до журналу' }, 403);
         const data = await res.json().catch(() => null);
-        if (!res.ok || !data) return json({ error: 'Journal unavailable' }, 502);
+        if (!res.ok || !data) return json({ error: 'Journal unavailable', details: 'Сервер журналу недоступний' }, 502);
         return json(normalizeJournal(data));
       }
       if (pathname === '/api/news') {

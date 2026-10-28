@@ -44,7 +44,7 @@ Wrangler покаже адресу виду `https://edupulse-pwa.<твій-ні
 
 1. браузер відкриває popup Firebase-обробника на домені проєкту (`edupulse-main.firebaseapp.com`);
 2. користувач входить в акаунт Google;
-3. проєкт повертає id-токен (`aud` = `edupulse-main`) і refresh-токен;
+3. обробник отримує код від Google, а Firebase SDK сам міняє його на id-токен проєкту (`aud` = `edupulse-main`) і refresh-токен — застосунок бере їх із увійденого користувача;
 4. воркер перевіряє токен через `accounts:lookup` — справжність і походження з проєкту коледжу;
 5. далі журнал читається через `GET /journal/me` з `Authorization: Bearer <токен>`.
 

@@ -505,12 +505,15 @@ async function signInWithGoogle() {
     const provider = new firebase.auth.GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' });
     const cred = await firebase.auth().signInWithPopup(provider);
-    const idToken = cred && cred.credential ? cred.credential.idToken : null;
-    const user = firebase.auth().currentUser;
+    // Вхід через IdP повертає credential без idToken: токен Firebase лежить
+    // у користувачі. Саме його чекає кабінет коледжу.
+    const user = cred && cred.user ? cred.user : firebase.auth().currentUser;
+    const idToken = user ? await user.getIdToken() : null;
+    const refreshToken = user && user.stsTokenManager ? user.stsTokenManager.refreshToken : null;
     if (!idToken) throw new Error('no token');
     const res = await fetch('/api/auth', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ idToken, refreshToken: user ? user.refreshToken : null }),
+      body: JSON.stringify({ idToken, refreshToken: refreshToken || null }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
