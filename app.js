@@ -402,14 +402,20 @@ function drawSchedule(data, fromCache) {
 // застосунок EduPulse, тож входимо так само: popup Firebase-обробника на домені
 // проєкту. Проєкт дозволяє вхід лише зі свого переліку доменів, а нашого там
 // немає, тому підміняємо дві речі: список авторизованих доменів (/v1/projects)
-// і redirectUrl обробника. Значення domains узяті з самого проєкту —
-// edupulse-main.web.app у переліку авторизованих.
+// і redirectUrl обробника.
+//
+// redirectUrl обробник читає як «домен застосунку» і передає його Google як
+// context_uri — а Google звіряє його з авторизованими JS-origin цього клієнта.
+// У «Authorized origins» клієнта коледжу є лише edupulse-main.firebaseapp.com,
+// тому підставляємо саме його: інакше Google відповідає «origin_mismatch».
+// edupulse-main.web.app у переліку авторизованих доменів проєкту є, але в
+// авторизованих origin Google — ні, тому з web.app вхід не проходить.
 
 const FB_SDK = [
   'https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js',
   'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js',
 ];
-const FB_APP_DOMAIN = 'https://edupulse-main.web.app';
+const FB_APP_DOMAIN = 'https://edupulse-main.firebaseapp.com';
 
 let fbPromise = null;
 
@@ -508,7 +514,7 @@ async function signInWithGoogle() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      toast(data.error === 'Account not allowed' ? 'Доступ лише для акаунтів @sclnau.com.ua' : (data.error || 'Не вдалося увійти'), 'err');
+      toast(data.details || data.error || 'Не вдалося увійти', 'err');
       return;
     }
     saveAuth(data);
@@ -524,7 +530,7 @@ async function signInWithGoogle() {
 function journalHead() {
   if (!state.token) {
     return '<div class="card"><b>Журнал потребує входу</b>' +
-      '<div class="muted small" style="margin-top:6px">Кабінет коледжу віддає журнал лише акаунтам @sclnau.com.ua. Увійдіть своїм акаунтом Google — журнал і сповіщення про нові оцінки запрацюють.</div>' +
+      '<div class="muted small" style="margin-top:6px">Журнал лежить у кабінеті коледжу й віддається лише після входу. Увійдіть своїм акаунтом Google — журнал і сповіщення про нові оцінки запрацюють.</div>' +
       '<div id="gSignIn" style="display:flex;justify-content:center;margin-top:14px">' +
       '<button id="fbSignIn" class="btn">Увійти через Google</button></div></div>';
   }
@@ -572,6 +578,10 @@ async function fetchJournal() {
       await logout();
       empty(el, 'Сесія завершилась. Увійдіть знову.');
       renderJournal();
+      return;
+    } else if (res.status === 403) {
+      const d = await res.json().catch(() => ({}));
+      empty(el, d.details || 'Цей акаунт не має доступу до журналу');
       return;
     }
   } catch (e) { }

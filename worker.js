@@ -533,17 +533,17 @@ export default {
           return json({ error: 'Bad request' }, 400);
         }
         if (!body || !body.idToken) return json({ error: 'idToken required' }, 400);
-        const cfg = await getAuthConfig(env);
-        const domain = cfg.workspace_domain || WORKSPACE_DOMAIN;
         // Токен випустив Firebase-проєкт коледжу — той самий, що й в офіційному
-        // застосунку. Кабінет приймає саме такі токени.
+        // застосунку. Кабінет приймає саме такі токени, а кого саме показувати —
+        // вирішує вже сам кабінет (він знає, чи це студент, чи батько).
         const user = await firebaseLookup(env, body.idToken);
         if (!user) return json({ error: 'Auth failed', details: 'Невірний токен' }, 401);
-        const email = (user.email || '').toLowerCase();
-        if (!email || !email.endsWith('@' + domain)) {
-          return json({ error: 'Account not allowed', details: 'Доступ лише для акаунтів @' + domain }, 403);
-        }
         const claims = jwtClaims(body.idToken);
+        if (claims && claims.aud && claims.aud !== FIREBASE_PROJECT_ID) {
+          return json({ error: 'Auth failed', details: 'Токен не від цього проєкту' }, 401);
+        }
+        const email = (user.email || '').toLowerCase();
+        if (!email) return json({ error: 'Auth failed', details: 'Акаунт без пошти' }, 401);
         const expiresIn = claims && claims.exp
           ? Math.max(60, claims.exp - Math.floor(Date.now() / 1000))
           : 3600;
@@ -583,7 +583,8 @@ export default {
         const res = await fetch(ttApiBase(env) + '/journal/me', {
           headers: { authorization: 'Bearer ' + token, 'user-agent': 'okhttp/4.12.0' },
         });
-        if (res.status === 401 || res.status === 403) return json({ error: 'Sign in required' }, 401);
+        if (res.status === 401) return json({ error: 'Sign in required' }, 401);
+        if (res.status === 403) return json({ error: 'Journal not allowed', details: 'Цей акаунт не має доступу до журналу' }, 403);
         const data = await res.json().catch(() => null);
         if (!res.ok || !data) return json({ error: 'Journal unavailable' }, 502);
         return json(normalizeJournal(data));
