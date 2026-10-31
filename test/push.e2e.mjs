@@ -108,6 +108,10 @@ const api = createServer((req, res) => {
     json(200, { google_client_id: 'test.apps.googleusercontent.com', workspace_domain: 'sclnau.com.ua' });
     return;
   }
+  if (url.pathname === '/v1/projects') {
+    json(200, { projectId: 'test', authorizedDomains: ['localhost', 'edupulse-main.firebaseapp.com'] });
+    return;
+  }
   if (url.pathname === '/journal/me') {
     if (!(req.headers.authorization || '').startsWith('Bearer ')) {
       json(401, { detail: 'Missing authorization credentials' });
@@ -180,6 +184,12 @@ try {
 
   const keyRes = await (await fetch(base + '/api/push/key')).json();
   check('публічний ключ VAPID', keyRes.publicKey, VAPID_PUBLIC_KEY);
+
+  // Вхід у журнал дозволений лише з домену, який є в переліку Firebase-проєкту.
+  const cfg = await (await fetch(base + '/api/config')).json();
+  check('перелік доменів у /api/config', (cfg.firebase.authorizedDomains || []).join(','), 'localhost,edupulse-main.firebaseapp.com');
+  check('вхід дозволено з localhost', String(cfg.firebase.originAllowed), 'true');
+  check('домен застосунку у відповіді', cfg.firebase.authDomain, 'edupulse-main.firebaseapp.com');
 
   const subRes = await fetch(base + '/api/push/subscribe', {
     method: 'POST',

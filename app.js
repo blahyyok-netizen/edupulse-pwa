@@ -81,11 +81,20 @@ async function logout() {
       body: JSON.stringify({ endpoint }),
     }).catch(() => null);
   }
+  // Спершу виходимо з Firebase, інакше спостерігач за авторизацією одразу
+  // підлогінить користувача назад.
+  signInBusy = true;
+  try {
+    if (typeof firebase !== 'undefined' && firebase.auth) {
+      await firebase.auth().signOut();
+    }
+  } catch (e) { }
   [LS.token, LS.refresh, LS.expires, LS.email, LS.journal].forEach((k) => localStorage.removeItem(k));
   state.token = null;
   state.refreshToken = null;
   state.expiresAt = 0;
   state.email = '';
+  signInBusy = false;
 }
 
 async function api(path, opts = {}) {
@@ -400,16 +409,19 @@ function drawSchedule(data, fromCache) {
 //
 // Кабінет коледжу приймає токен того самого Firebase-проєкту, що й офіційний
 // застосунок EduPulse, тож входимо так само: popup Firebase-обробника на домені
-// проєкту. Проєкт дозволяє вхід лише зі свого переліку доменів, а нашого там
-// немає, тому підміняємо дві речі: список авторизованих доменів (/v1/projects)
-// і redirectUrl обробника.
+// проєкту (edupulse-main.firebaseapp.com).
 //
-// redirectUrl обробник читає як «домен застосунку» і передає його Google як
-// context_uri — а Google звіряє його з авторизованими JS-origin цього клієнта.
-// У «Authorized origins» клієнта коледжу є лише edupulse-main.firebaseapp.com,
-// тому підставляємо саме його: інакше Google відповідає «origin_mismatch».
-// edupulse-main.web.app у переліку авторизованих доменів проєкту є, але в
-// авторизованих origin Google — ні, тому з web.app вхід не проходить.
+// Подію входу Firebase приймає лише тоді, коли домен сторінки, що відкрила його
+// iframe авторизації, є в переліку «Authorized domains» проєкту. Перелік бере
+// сам Firebase (/v1/projects) — підмінити його з нашого домену неможливо: він
+// живе в консолі проєкту, а змінює його лише адміністратор коледжу. Тому перед
+// входом питаємо воркер, чи дозволено наш домен, і якщо ні — одразу кажемо, що
+// саме треба додати в консолі, замість хвилин очікування й «вхід скасовано».
+//
+// redirectUrl обробника лишається доменом проєкту: обробник читає його як
+// «домен застосунку» і передає Google як context_uri, а в OAuth-клієнті
+// коледжу авторизований лише edupulse-main.firebaseapp.com — з іншим доменом
+// Google відповідає «origin_mismatch».
 
 const FB_SDK = [
   'https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js',
@@ -418,6 +430,7 @@ const FB_SDK = [
 const FB_APP_DOMAIN = 'https://edupulse-main.firebaseapp.com';
 
 let fbPromise = null;
+let fbConfig = null;
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -430,6 +443,8 @@ function loadScript(src) {
   });
 }
 
+// Обробник Firebase має відкритися саме на домені проєкту: цей домен Google
+// звіряє з авторизованими origin OAuth-клієнта коледжу.
 function patchFirebaseAuth() {
   if (window.__epFbPatched) return;
   window.__epFbPatched = true;
@@ -454,23 +469,6 @@ function patchFirebaseAuth() {
     }
     return open(url, ...rest);
   };
-
-  const doFetch = window.fetch.bind(window);
-  window.fetch = function (input, init) {
-    const raw = typeof input === 'string' ? input : ((input && input.url) || '');
-    if (raw.indexOf('/v1/projects') !== -1) {
-      return doFetch(input, init).then(async (res) => {
-        const data = await res.clone().json().catch(() => null);
-        if (!data || !Array.isArray(data.authorizedDomains)) return res;
-        if (data.authorizedDomains.indexOf(location.hostname) === -1) {
-          data.authorizedDomains.push(location.hostname);
-          return new Response(JSON.stringify(data), { status: 200, headers: { 'content-type': 'application/json' } });
-        }
-        return res;
-      });
-    }
-    return doFetch(input, init);
-  };
 }
 
 function firebaseApp() {
@@ -479,63 +477,173 @@ function firebaseApp() {
     const cfg = await apiJson('/api/config');
     const fb = cfg.firebase;
     if (!fb || !fb.apiKey) throw new Error('config');
+    fbConfig = fb;
     patchFirebaseAuth();
     for (const src of FB_SDK) await loadScript(src);
-    return firebase.initializeApp({ apiKey: fb.apiKey, authDomain: fb.authDomain, projectId: fb.projectId });
+    const app = firebase.initializeApp({ apiKey: fb.apiKey, authDomain: fb.authDomain, projectId: fb.projectId });
+    watchFirebaseAuth();
+    return app;
   })();
   fbPromise.catch(() => { fbPromise = null; });
   return fbPromise;
+}
+
+// Перевіряємо перелік доменів ще раз — щоб «Спробувати ще раз» бачив зміни,
+// які коледж щойно вніс у консоль Firebase.
+async function refreshFirebaseConfig() {
+  const cfg = await apiJson('/api/config');
+  if (cfg && cfg.firebase && cfg.firebase.apiKey) fbConfig = cfg.firebase;
+  return fbConfig;
+}
+
+// Firebase віддасть подію входу лише сторінці з дозволеним доменом. Якщо
+// нашого домену в переліку проєкту немає, popup відкривати безглуздо: вхід
+// завершиться помилкою за кілька хвилин. Краще одразу сказати, що треба
+// додати домен у консолі коледжу.
+function signInDomainError() {
+  if (!fbConfig || fbConfig.originAllowed !== false) return null;
+  const err = new Error('domain not allowed');
+  err.code = 'ep-domain-not-allowed';
+  err.domain = location.hostname;
+  return err;
+}
+
+// Firebase звіряє hostname сторінки з переліком «Authorized domains», тож
+// 127.0.0.1 він не вважає за localhost — локально треба відкривати саме
+// http://localhost:8799.
+function domainBlockedText(host) {
+  const h = host || location.hostname;
+  if (h === '127.0.0.1' || h === '::1' || h === '[::1]') {
+    return 'Локально Firebase дозволяє вхід лише з домену localhost — відкрийте застосунок за http://localhost:8799';
+  }
+  return 'Домен ' + h + ' не дозволений у Firebase-проєкті коледжу, тож Firebase не віддасть подію входу. Додайте цей домен у Firebase Console → Authentication → Settings → Authorized domains — після цього вхід працюватиме без змін у коді';
 }
 
 function firebaseErrorText(e) {
   const code = e && e.code ? String(e.code) : '';
   if (code === 'ep-popup-blocked') return 'Браузер заблокував вікно входу — дозвольте спливаючі вікна для цього сайту';
   if (code === 'auth/popup-blocked') return 'Браузер заблокував вікно входу — дозвольте спливаючі вікна';
-  if (code === 'auth/popup-closed-by-user') return 'Вхід скасовано';
-  if (code === 'auth/unauthorized-domain') return 'Домен не авторизований у Firebase-проєкті коледжу';
+  if (code === 'ep-domain-not-allowed') return domainBlockedText(e.domain || location.hostname);
+  if (code === 'auth/popup-closed-by-user') return 'Вхід не завершено — спробуйте ще раз';
+  if (code === 'auth/unauthorized-domain') return domainBlockedText(location.hostname);
   if (code === 'auth/network-request-failed') return 'Немає звʼязку з сервером авторизації';
+  if (e && e.details) return e.details;
   return 'Не вдалося увійти через Google';
+}
+
+// Firebase доставляє подію входу кількома каналами: popup-вікно, сховище на
+// домені проєкту, і стан авторизації. Обіцянка signInWithPopup може бути
+// відхилена, поки сесія вже створилася — тож чекаємо на currentUser.
+function firebaseUser(timeoutMs) {
+  const auth = firebase.auth();
+  if (auth.currentUser) return Promise.resolve(auth.currentUser);
+  return new Promise((resolve) => {
+    let done = false;
+    let unsub = () => { };
+    const finish = (u) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unsub();
+      resolve(u);
+    };
+    unsub = auth.onAuthStateChanged((u) => { if (u) finish(u); });
+    const timer = setTimeout(() => finish(auth.currentUser), timeoutMs);
+  });
+}
+
+async function exchangeFirebaseUser(user) {
+  const idToken = user ? await user.getIdToken() : null;
+  const refreshToken = user && user.stsTokenManager ? user.stsTokenManager.refreshToken : null;
+  if (!idToken) throw new Error('no token');
+  const res = await fetch('/api/auth', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ idToken, refreshToken: refreshToken || null }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || 'auth failed');
+    err.details = data.details || '';
+    throw err;
+  }
+  saveAuth(data);
+  return data;
+}
+
+let authWatchBound = false;
+let signInBusy = false;
+
+// Сесія може з'явитися і після відхилення popup-обіцянки: тоді треба
+// обміняти її на сесію воркера, щоб журнал відкрився.
+function watchFirebaseAuth() {
+  if (authWatchBound) return;
+  authWatchBound = true;
+  firebase.auth().onAuthStateChanged(async (user) => {
+    if (!user || state.token || signInBusy) return;
+    try {
+      await exchangeFirebaseUser(user);
+      toast('Вхід виконано');
+      renderJournal();
+    } catch (e) { }
+  });
 }
 
 async function signInWithGoogle() {
   const btn = $('fbSignIn');
   if (btn) { btn.disabled = true; btn.textContent = 'Вхід…'; }
+  signInBusy = true;
   try {
+    // Перевірка домену — до завантаження SDK: вона потребує лише конфігурації.
+    await refreshFirebaseConfig().catch(() => { });
+    const domainErr = signInDomainError();
+    if (domainErr) throw domainErr;
     await firebaseApp();
     const provider = new firebase.auth.GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' });
-    const cred = await firebase.auth().signInWithPopup(provider);
-    // Вхід через IdP повертає credential без idToken: токен Firebase лежить
-    // у користувачі. Саме його чекає кабінет коледжу.
-    const user = cred && cred.user ? cred.user : firebase.auth().currentUser;
-    const idToken = user ? await user.getIdToken() : null;
-    const refreshToken = user && user.stsTokenManager ? user.stsTokenManager.refreshToken : null;
-    if (!idToken) throw new Error('no token');
-    const res = await fetch('/api/auth', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ idToken, refreshToken: refreshToken || null }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      toast(data.details || data.error || 'Не вдалося увійти', 'err');
-      return;
+    let user = null;
+    try {
+      const cred = await firebase.auth().signInWithPopup(provider);
+      // Вхід через IdP повертає credential без idToken: токен Firebase лежить
+      // у користувачі. Саме його чекає кабінет коледжу.
+      user = (cred && cred.user) || firebase.auth().currentUser;
+    } catch (e) {
+      user = await firebaseUser(15000);
+      if (!user) throw e;
     }
-    saveAuth(data);
+    if (!user) user = await firebaseUser(3000);
+    if (!user) throw new Error('no user');
+    await exchangeFirebaseUser(user);
     toast('Вхід виконано');
     renderJournal();
   } catch (e) {
     toast(firebaseErrorText(e), 'err');
+    if (e && e.code === 'auth/unauthorized-domain') {
+      // Firebase сам відповів, що домен не дозволений — показуємо це в картці
+      // журналу, щоб пояснення лишилося на екрані, а не зникло зі сповіщенням.
+      fbConfig = Object.assign({}, fbConfig, { originAllowed: false });
+      const head = $('journalHead');
+      if (head) head.dataset.mode = '';
+      renderJournal();
+    }
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Увійти через Google'; }
+    signInBusy = false;
+    const cur = $('fbSignIn');
+    if (cur) {
+      cur.disabled = false;
+      cur.textContent = signInDomainError() ? 'Спробувати ще раз' : 'Увійти через Google';
+    }
   }
 }
 
 function journalHead() {
   if (!state.token) {
-    return '<div class="card"><b>Журнал потребує входу</b>' +
-      '<div class="muted small" style="margin-top:6px">Журнал лежить у кабінеті коледжу й віддається лише після входу. Увійдіть своїм акаунтом Google — журнал і сповіщення про нові оцінки запрацюють.</div>' +
+    const blocked = !!(fbConfig && fbConfig.originAllowed === false);
+    const note = blocked
+      ? '<div class="muted small" style="margin-top:6px;line-height:1.5">' + esc(domainBlockedText(location.hostname)) + '.</div>'
+      : '<div class="muted small" style="margin-top:6px">Журнал лежить у кабінеті коледжу й віддається лише після входу. Увійдіть своїм акаунтом Google — журнал і сповіщення про нові оцінки запрацюють.</div>';
+    return '<div class="card"><b>Журнал потребує входу</b>' + note +
       '<div id="gSignIn" style="display:flex;justify-content:center;margin-top:14px">' +
-      '<button id="fbSignIn" class="btn">Увійти через Google</button></div></div>';
+      '<button id="fbSignIn" class="btn">' + (blocked ? 'Спробувати ще раз' : 'Увійти через Google') + '</button></div></div>';
   }
   return '<div class="row" style="align-items:center;margin-bottom:0">' +
     '<span class="muted small" id="whoami">' + esc(state.email || 'Ви увійшли') + '</span>' +
@@ -549,13 +657,18 @@ async function renderJournal() {
   const head = $('journalHead');
   const mode = state.token ? 'in' : 'out';
   if (head.dataset.mode !== mode) {
+    if (!state.token) {
+      // Домен має бути дозволений у Firebase-проєкті коледжу — інакше вхід не
+      // завершиться, тож показуємо це одразу, а не через кілька хвилин.
+      // Сам SDK Firebase для перевірки не потрібен — достатньо конфігурації.
+      await refreshFirebaseConfig().catch(() => { });
+    }
     head.innerHTML = journalHead();
     head.dataset.mode = mode;
     if (state.token) {
       $('logoutBtn').onclick = async () => { await logout(); renderJournal(); };
-    } else {
+    } else if ($('fbSignIn')) {
       $('fbSignIn').onclick = signInWithGoogle;
-      firebaseApp().catch(() => { });
     }
   }
   if (!state.token) {

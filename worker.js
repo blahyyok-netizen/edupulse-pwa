@@ -7,6 +7,7 @@ import icon192 from './icon-192.png';
 import icon512 from './icon-512.png';
 import appleIcon from './apple-touch-icon.png';
 import { encryptPush, generateEcdhKeyPair, signVapidJwt, b64uDecode } from './webpush.mjs';
+import { domainAllowed } from './auth-domains.mjs';
 
 const TT = 'https://tt.sclnau.com.ua';
 const TT_API = 'https://tt-api.sclnau.com.ua';
@@ -132,6 +133,27 @@ async function getAuthConfig(env) {
   } catch (e) { }
   if (!authConfig) authConfig = { google_client_id: GOOGLE_CLIENT_ID, workspace_domain: WORKSPACE_DOMAIN };
   return authConfig;
+}
+
+// Перелік доменів, з яких Firebase-проєкт дозволяє вхід. Той самий список
+// Firebase бере в /v1/projects, коли iframe авторизації перевіряє, чи може
+// сторінка, що його відкрила, отримати подію входу. Змінити цей список може
+// лише адміністратор проєкту, тож ми його читаємо, а не підміняємо.
+let domainCache = null;
+
+async function firebaseAuthorizedDomains(env) {
+  if (domainCache && Date.now() - domainCache.at < 60 * 1000) return domainCache.list;
+  try {
+    const res = await fetch(firebaseBase(env) + '/v1/projects?key=' + FIREBASE_API_KEY);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Array.isArray(data.authorizedDomains) && data.authorizedDomains.length) {
+        domainCache = { list: data.authorizedDomains, at: Date.now() };
+        return domainCache.list;
+      }
+    }
+  } catch (e) { }
+  return domainCache ? domainCache.list : [];
 }
 
 // Перевірка токена на боці Firebase: відповідь приходить лише для справжнього
@@ -542,6 +564,7 @@ export default {
       }
       if (pathname === '/api/config') {
         const cfg = await getAuthConfig(env);
+        const domains = await firebaseAuthorizedDomains(env);
         return json({
           firebase: {
             apiKey: FIREBASE_API_KEY,
@@ -549,6 +572,8 @@ export default {
             projectId: FIREBASE_PROJECT_ID,
             appName: FIREBASE_APP_NAME,
             handlerOrigin: 'https://' + FIREBASE_AUTH_DOMAIN,
+            authorizedDomains: domains,
+            originAllowed: domainAllowed(url.hostname, domains),
           },
           workspaceDomain: cfg.workspace_domain || WORKSPACE_DOMAIN,
         });
