@@ -287,6 +287,54 @@ async function fetchMyJournal(env, token) {
   }
 }
 
+// --- Батьківський доступ ---
+//
+// Коледж сам зробив цей шлях: студент у своєму застосунку генерує QR
+// (`/parent/qr/create` — під його токеном), а батько той QR активує. Активація
+// публічна й не потребує входу Google, тож працює з будь-якого домену і на
+// будь-якому телефоні, включно з iPhone. Саме токен і є згода студента: без
+// його коду чужого журналу не існує.
+
+async function parentActivate(env, code) {
+  const res = await fetch(ttApiBase(env) + '/parent/qr/activate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'user-agent': 'okhttp/4.12.0' },
+    body: JSON.stringify({ qr_token: code }),
+  }).catch(() => null);
+  if (!res) return { error: 'Сервер коледжу недоступний', status: 502 };
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const known = { 404: 'Коду такого немає — сгенеруйте новий QR (він короткоживучий)', 410: 'Термін дії коду минув — сгенеруйте новий QR' };
+    return { error: known[res.status] || (data.detail && String(data.detail)) || 'Не вдалося активувати код', status: res.status };
+  }
+  if (!data || !data.parent_access_token) return { error: 'Сервер не повернув доступ', status: 502 };
+  return { token: data.parent_access_token, expiresIn: Number(data.expires_in_seconds || 0) || null };
+}
+
+async function parentJournal(env, token) {
+  const res = await fetch(ttApiBase(env) + '/parent/journal', {
+    headers: { authorization: 'Bearer ' + token, 'user-agent': 'okhttp/4.12.0' },
+  }).catch(() => null);
+  if (!res) return { status: 0 };
+  if (!res.ok) return { status: res.status };
+  const data = await res.json().catch(() => null);
+  return { status: 200, journal: data ? normalizeJournal(data) : null };
+}
+
+// Використовується хронологією: тут достатньо «є журнал / немає журналу».
+async function fetchParentJournal(env, token) {
+  return (await parentJournal(env, token)).journal || null;
+}
+
+async function parentRevoke(env, token) {
+  const res = await fetch(ttApiBase(env) + '/parent/token/revoke', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'user-agent': 'okhttp/4.12.0' },
+    body: JSON.stringify({ parent_access_token: token }),
+  }).catch(() => null);
+  return !!res && res.ok;
+}
+
 // --- Сповіщення (Web Push) ---
 
 async function sha256Hex(text) {
@@ -306,8 +354,13 @@ async function listKvKeys(kv, prefix) {
 }
 
 // Сесія підписника: id-токен протухає за годину, тож тримаємо в KV і refresh-токен,
-// і оновлений id-токен.
+// і оновлений id-токен. Батьківський доступ — окрема гілка: там токен видає сам
+// кабінет і він не оновлюється, бо батько не входить через Google.
 async function sessionFor(env, sub) {
+  if (sub.parentToken) {
+    if (sub.parentExpires && sub.parentExpires <= Date.now()) return null;
+    return { token: sub.parentToken, changed: false, parent: true };
+  }
   if (sub.idToken && sub.idTokenExpires && sub.idTokenExpires > Date.now() + 60000) {
     return { token: sub.idToken, refreshToken: sub.refreshToken, changed: false };
   }
@@ -458,7 +511,7 @@ async function checkSubscription(env, sub, keyPair, journal) {
     const payload = {
       title: changes.length === 1 ? 'Новий запис у журналі' : 'Нові записи в журналі: ' + changes.length,
       body: changes.slice(0, 3).map(pushText).join('\n') + (changes.length > 3 ? '\n…' : ''),
-      url: '/#/journal',
+      url: sub.parentToken ? '/#/parent' : '/#/journal',
       tag: 'journal',
     };
     const res = await sendPush(env, sub, payload, keyPair);
@@ -498,23 +551,28 @@ export default {
           return json({ error: 'Invalid subscription', details: 'Підписка некоректна' }, 400);
         }
         const refreshToken = String(body.refreshToken || '').trim();
-        if (!refreshToken) return json({ error: 'Sign in required', details: 'Спершу увійдіть' }, 401);
+        const parentToken = String(body.parentToken || '').trim();
+        if (!refreshToken && !parentToken) return json({ error: 'Sign in required', details: 'Спершу увійдіть' }, 401);
         const id = await sha256Hex(sub.endpoint);
         const record = {
           endpoint: sub.endpoint,
           p256dh: sub.keys.p256dh,
           auth: sub.keys.auth,
           email: String(body.email || '').trim(),
-          refreshToken,
+          refreshToken: refreshToken || null,
           idToken: null,
           idTokenExpires: 0,
+          parentToken: parentToken || null,
+          parentExpires: parentToken ? Number(body.parentExpires || 0) || 0 : 0,
           createdAt: Date.now(),
           marks: {},
         };
         // Базовий знімок журналу: щоб перша перевірка не повідомила про всю історію.
         const session = await sessionFor(env, record);
         if (session) {
-          const journal = await fetchMyJournal(env, session.token);
+          const journal = session.parent
+            ? await fetchParentJournal(env, session.token)
+            : await fetchMyJournal(env, session.token);
           if (journal) record.marks = pruneMarks(collectMarks(journal).marks);
         }
         await env.PUSH_SUBS.put(PUSH_PREFIX + id, JSON.stringify(record));
@@ -657,6 +715,37 @@ export default {
         if (!res.ok || !data) return json({ error: 'Journal unavailable', details: 'Сервер журналу недоступний' }, 502);
         return json(normalizeJournal(data));
       }
+      if (pathname === '/api/parent/activate' && request.method === 'POST') {
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed', details: 'Запит не з нашого домену' }, 403);
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return json({ error: 'Bad request', details: 'Некоректний запит' }, 400);
+        }
+        const code = String((body && body.code) || '').trim();
+        if (!code) return json({ error: 'Code required', details: 'Немає коду з QR' }, 400);
+        const r = await parentActivate(env, code);
+        if (r.error) return json({ error: r.error, details: r.error }, r.status || 400);
+        return json({ token: r.token, expiresIn: r.expiresIn });
+      }
+      if (pathname === '/api/parent/journal') {
+        const auth = request.headers.get('authorization') || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+        if (!token) return json({ error: 'Sign in required', details: 'Спершу відскануйте QR' }, 401);
+        const r = await parentJournal(env, token);
+        if (r.status === 401 || r.status === 403) return json({ error: 'Access expired', details: 'Доступ завершився — потрібен новий QR' }, 401);
+        if (r.status === 0 || r.status !== 200 || !r.journal) return json({ error: 'Journal unavailable', details: 'Сервер журналу недоступний' }, 502);
+        return json(r.journal);
+      }
+      if (pathname === '/api/parent/revoke' && request.method === 'POST') {
+        if (!isSameOrigin(request, origin)) return json({ error: 'Origin not allowed', details: 'Запит не з нашого домену' }, 403);
+        const auth = request.headers.get('authorization') || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+        if (!token) return json({ error: 'Sign in required', details: 'Немає доступу' }, 401);
+        const ok = await parentRevoke(env, token);
+        return json({ ok });
+      }
       if (pathname === '/api/news') {
         return passThrough(WP, '/posts' + (q ? '?' + q : ''));
       }
@@ -716,8 +805,22 @@ export default {
       }
       try {
         const session = await sessionFor(env, sub);
-        if (!session) continue;
-        const journal = await fetchMyJournal(env, session.token);
+        if (!session) {
+          // Батьківський доступ минув — підписка більше нічого не може перевірити.
+          if (sub.parentToken) await env.PUSH_SUBS.delete(name);
+          continue;
+        }
+        let journal;
+        if (session.parent) {
+          const r = await parentJournal(env, session.token);
+          if (r.status === 401 || r.status === 403) {
+            await env.PUSH_SUBS.delete(name);
+            continue;
+          }
+          journal = r.journal;
+        } else {
+          journal = await fetchMyJournal(env, session.token);
+        }
         if (!journal) continue;
         const res = await checkSubscription(env, sub, keyPair, journal);
         if (res.dead) {

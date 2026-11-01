@@ -117,6 +117,8 @@ body {
 
 .list { display: flex; flex-direction: column; gap: 10px; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 16px; }
+.scan-video { display: none; width: 100%; margin-top: 12px; border-radius: 14px; background: #000; }
+.scan-video.on { display: block; }
 .pair { display: flex; gap: 12px; align-items: flex-start; }
 .pair-num {
   flex: 0 0 44px; height: 44px; border-radius: 12px; display: flex; flex-direction: column;

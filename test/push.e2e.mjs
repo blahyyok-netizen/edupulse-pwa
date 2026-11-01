@@ -3,7 +3,8 @@
 //
 // 1. піднімаємо сервер, який приймає push, розшифровує payload і перевіряє підпис VAPID,
 // 2. підписуємо тестового «студента» через /api/push/subscribe,
-// 3. запускаємо хронологію воркера: спершу без змін, потім з «новою» оцінкою.
+// 3. запускаємо хронологію воркера: спершу без змін, потім з «новою» оцінкою,
+// 4. повторюємо те саме для «батька», який увійшов за QR — без Google взагалі.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -16,6 +17,30 @@ const API_PORT = 8795;
 const PERSIST = '.wrangler/test-state';
 const VAPID_PUBLIC_KEY = 'BD9WRsrpsAahSZYjE3IOWnJCUpzY0l0jV_-HD6pyAwTz0uZSUnewbMc9N-JvMy3lRBc-TOoW4H-zzxLT2RSAd3o';
 const ENDPOINT = 'http://localhost:' + PORT + '/push/test-1';
+const ENDPOINT_PARENT = 'http://localhost:' + PORT + '/push/test-2';
+const PARENT_QR_OK = 'qr-parent-ok';
+
+function parentJournalShape() {
+  return {
+    journal: [
+      {
+        discipline_id: 3,
+        discipline: 'Математика',
+        teacher: 'Викладач',
+        sessions: [
+          {
+            date: '2026-10-12',
+            pair_number: 1,
+            entries: [
+              { kind: 'lesson', number: '1', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: { value: '9', comment: '' } },
+              { kind: 'lesson', number: '2', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: null },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
 
 const FS = '\u001f';
 const RS = '\u001e';
@@ -117,25 +142,32 @@ const api = createServer((req, res) => {
       json(401, { detail: 'Missing authorization credentials' });
       return;
     }
-    json(200, {
-      journal: [
-        {
-          discipline_id: 3,
-          discipline: 'Математика',
-          teacher: 'Викладач',
-          sessions: [
-            {
-              date: '2026-10-12',
-              pair_number: 1,
-              entries: [
-                { kind: 'lesson', number: '1', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: { value: '9', comment: '' } },
-                { kind: 'lesson', number: '2', type: 'Комбіноване', topic: 'Тема', homework: '', self_study: '', mark: null },
-              ],
-            },
-          ],
-        },
-      ],
+    json(200, parentJournalShape());
+    return;
+  }
+  if (url.pathname === '/parent/qr/activate') {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw || '{}');
+      if (body.qr_token !== PARENT_QR_OK) {
+        json(404, { detail: 'QR token not found' });
+        return;
+      }
+      json(200, { parent_access_token: 'parent-token-1', expires_in_seconds: 1800 });
     });
+    return;
+  }
+  if (url.pathname === '/parent/journal') {
+    if ((req.headers.authorization || '') !== 'Bearer parent-token-1') {
+      json(401, { detail: 'Could not validate credentials' });
+      return;
+    }
+    json(200, parentJournalShape());
+    return;
+  }
+  if (url.pathname === '/parent/token/revoke') {
+    json(200, { detail: 'Parent token revoked' });
     return;
   }
   json(404, { detail: 'Not Found' });
@@ -171,6 +203,36 @@ function kvCmd(args) {
   return spawnSync(process.execPath, [WRANGLER, ...args, '--binding', 'PUSH_SUBS', '--local', '--persist-to', PERSIST], {
     cwd, encoding: 'utf8',
   });
+}
+
+async function kvKey(endpoint) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(endpoint));
+  return 'sub:' + [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function kvGetRecord(endpoint) {
+  const got = kvCmd(['kv', 'key', 'get', await kvKey(endpoint), '--text']);
+  const out = got.stdout || '';
+  return JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1));
+}
+
+// Прибирає з знімка одну оцінку — так, ніби її ще не існувало до цієї хвилини.
+async function eraseOneMark(endpoint) {
+  const record = await kvGetRecord(endpoint);
+  const keys = Object.keys(record.marks || {});
+  let mark = '';
+  let found = false;
+  for (const k of keys) {
+    const parts = (record.marks[k] || '').split(RS).filter(Boolean);
+    const withMark = parts.find((p) => (p.split(FS)[3] || '') !== '');
+    if (!withMark) continue;
+    mark = withMark.split(FS)[3];
+    record.marks[k] = parts.map((p) => (p === withMark ? p.slice(0, p.length - mark.length) : p)).join(RS);
+    found = true;
+    break;
+  }
+  await kvCmd(['kv', 'key', 'put', await kvKey(endpoint), JSON.stringify(record)]);
+  return { count: keys.length, mark, found };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -209,28 +271,10 @@ try {
   // Імітуємо нову оцінку: у знімку, який зберіг сервер, прибираємо оцінку
   // (тобто «до того, як викладач поставив её»). У журналі оцінка вже є —
   // воркер має побачити різницю і надіслати сповіщення.
-  const key = 'sub:' + [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ENDPOINT)))]
-    .map((b) => b.toString(16).padStart(2, '0')).join('');
-
-  const got = kvCmd(['kv', 'key', 'get', key, '--text']);
-  const raw = got.stdout.slice(got.stdout.indexOf('{'), got.stdout.lastIndexOf('}') + 1);
-  const record = JSON.parse(raw);
-  const markKeys = Object.keys(record.marks || {});
-  check('у знімку є оцінки', String(markKeys.length > 0), 'true');
-
-  let expectedMark = '';
-  let target = '';
-  for (const k of markKeys) {
-    const parts = (record.marks[k] || '').split(RS).filter(Boolean);
-    const withMark = parts.find((p) => (p.split(FS)[3] || '') !== '');
-    if (!withMark) continue;
-    expectedMark = withMark.split(FS)[3];
-    record.marks[k] = parts.map((p) => (p === withMark ? p.slice(0, p.length - expectedMark.length) : p)).join(RS);
-    target = k;
-    break;
-  }
-  check('знайдено оцінку у знімку', String(!!target), 'true');
-  kvCmd(['kv', 'key', 'put', key, JSON.stringify(record)]);
+  const erased = await eraseOneMark(ENDPOINT);
+  check('у знімку є оцінки', String(erased.count > 0), 'true');
+  check('знайдено оцінку у знімку', String(erased.found), 'true');
+  const expectedMark = erased.mark;
 
   await fetch(base + '/__scheduled?cron=23,53');
   await sleep(5000);
@@ -246,6 +290,62 @@ try {
     console.log('     сповіщення: ' + payload.title + ' — ' + payload.body.replace(/\n/g, ' | '));
     check('у сповіщенні є оцінка', String(payload.body.includes(expectedMark)), 'true');
     check('посилання веде в журнал', payload.url, '/#/journal');
+  }
+
+  // --- Батьківський доступ: QR без входу Google ---
+  const badAct = await fetch(base + '/api/parent/activate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({ code: 'qr-не-існує' }),
+  });
+  check('невідомий QR → 404', badAct.status, 404);
+  const badTxt = ((await badAct.json()).details || '');
+  check('пояснення зрозуміле', String(/новий QR/.test(badTxt)), 'true');
+
+  const actRes = await fetch(base + '/api/parent/activate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({ code: PARENT_QR_OK }),
+  });
+  check('активація QR', actRes.status, 200);
+  const act = await actRes.json();
+  check('доступ віддано', act.token, 'parent-token-1');
+  check('срок доступу', String(act.expiresIn), '1800');
+
+  check('журнал без доступу → 401', (await fetch(base + '/api/parent/journal')).status, 401);
+  check('чужий доступ → 401', (await fetch(base + '/api/parent/journal', {
+    headers: { authorization: 'Bearer wrong' },
+  })).status, 401);
+  const pjRes = await fetch(base + '/api/parent/journal', { headers: { authorization: 'Bearer ' + act.token } });
+  check('журнал для батьків', pjRes.status, 200);
+  const pj = await pjRes.json();
+  check('предметів у журналі', String((pj.journal || []).length), '1');
+
+  const pSub = await fetch(base + '/api/push/subscribe', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({
+      subscription: { endpoint: ENDPOINT_PARENT, keys: { p256dh: b64uEncode(uaPublicRaw), auth: authSecret } },
+      parentToken: act.token,
+      parentExpires: Date.now() + 1800 * 1000,
+    }),
+  });
+  check('підписка батька', pSub.status, 200);
+  const pRecord = await kvGetRecord(ENDPOINT_PARENT);
+  check('у підписці немає Google-токена', String(!!pRecord.refreshToken), 'false');
+  check('батьківський знімок оцінок', String(Object.keys(pRecord.marks || {}).length > 0), 'true');
+
+  const pErased = await eraseOneMark(ENDPOINT_PARENT);
+  check('у батьківському знімку є оцінка', String(pErased.found), 'true');
+
+  await fetch(base + '/__scheduled?cron=23,53');
+  await sleep(5000);
+  check('батько отримує сповіщення', String(received.length), '2');
+  if (received.length > 1) {
+    const msg = received[1];
+    const payload = JSON.parse(await decryptPush(new Uint8Array(msg.body), uaPublicRaw, uaPrivateRaw, authSecretRaw));
+    check('у сповіщенні є оцінка', String(payload.body.includes(pErased.mark)), 'true');
+    check('посилання веде в батьківський журнал', payload.url, '/#/parent');
   }
 } catch (e) {
   console.log('ПОМИЛКА: ' + e.stack);
