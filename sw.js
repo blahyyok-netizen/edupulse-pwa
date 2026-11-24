@@ -58,7 +58,8 @@ self.addEventListener('notificationclick', (e) => {
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
       for (const c of list) {
         if ('focus' in c) {
-          return c.focus().then(() => (c.navigate ? c.navigate(url) : null));
+          // navigate() відхиляється, якщо вікно ще не активне — фокус лишається.
+          return c.focus().then(() => (c.navigate ? c.navigate(url).catch(() => null) : null));
         }
       }
       return self.clients.openWindow(url);

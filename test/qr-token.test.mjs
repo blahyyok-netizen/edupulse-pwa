@@ -34,6 +34,12 @@ check('токен у шляху', qrTokenFrom('https://x/parent/qr/abc-123'), 'a
 check('хеш не потрапляє в код', qrTokenFrom('https://x/parent/qr/abc-123#tail'), 'abc-123');
 check('порожній рядок', qrTokenFrom(''), '');
 check('нічого немає', qrTokenFrom(null), '');
+// «%» без двох шістнадцяткових цифр — це URIError у decodeURIComponent.
+// Кнопка «Відкрити журнал» не має мовчки вмирати через такий рядок.
+check('пошкоджене кодування в параметрі', qrTokenFrom('https://x/?qr_token=abc%'), 'abc%');
+check('невірні шістнадцяткові цифри', qrTokenFrom('https://x/parent/qr/a%zzb'), 'a%zzb');
+check('кодування пробілу', qrTokenFrom('https://x/?qr_token=abc%20def'), 'abc def');
+check('відсоток у голому рядку', qrTokenFrom('abc%def'), 'abc%def');
 
 console.log(failed ? '\n' + failed + ' перевірок впало' : '\nУсі перевірки пройдено');
 process.exit(failed ? 1 : 0);

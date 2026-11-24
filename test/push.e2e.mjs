@@ -14,10 +14,13 @@ import { b64uDecode, b64uEncode } from '../webpush.mjs';
 const PORT = 8791;
 const WORKER_PORT = 8792;
 const API_PORT = 8795;
+// Порт, на якому ніхто не слухає: імітація обриву з'єднання з PHP-сайтом коледжу.
+const DEAD_PORT = 8796;
 const PERSIST = '.wrangler/test-state';
 const VAPID_PUBLIC_KEY = 'BD9WRsrpsAahSZYjE3IOWnJCUpzY0l0jV_-HD6pyAwTz0uZSUnewbMc9N-JvMy3lRBc-TOoW4H-zzxLT2RSAd3o';
 const ENDPOINT = 'http://localhost:' + PORT + '/push/test-1';
 const ENDPOINT_PARENT = 'http://localhost:' + PORT + '/push/test-2';
+const ENDPOINT_DEAD = 'http://localhost:' + PORT + '/push/test-3';
 const PARENT_QR_OK = 'qr-parent-ok';
 
 function parentJournalShape() {
@@ -126,7 +129,16 @@ const api = createServer((req, res) => {
     res.end(JSON.stringify(body));
   };
   if (url.pathname === '/v1/accounts:refresh') {
-    json(200, { id_token: 'test-id-token', refresh_token: 'test-refresh', expires_in: 3600 });
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      // Відкликаний refresh-токен Firebase віддає саме як 400.
+      if (raw.includes('dead-refresh')) {
+        json(400, { error: { message: 'INVALID_REFRESH_TOKEN' } });
+        return;
+      }
+      json(200, { id_token: 'test-id-token', refresh_token: 'test-refresh', expires_in: 3600 });
+    });
     return;
   }
   if (url.pathname === '/admin/auth/config') {
@@ -150,6 +162,11 @@ const api = createServer((req, res) => {
     req.on('data', (c) => { raw += c; });
     req.on('end', () => {
       const body = JSON.parse(raw || '{}');
+      // Саме так відповідає справжній кабінет: detail — масив, а не рядок.
+      if (String(body.qr_token || '').length < 10) {
+        json(422, { detail: [{ type: 'string_too_short', loc: ['body', 'qr_token'], msg: 'String should have at least 10 characters', input: body.qr_token, ctx: { min_length: 10 } }] });
+        return;
+      }
       if (body.qr_token !== PARENT_QR_OK) {
         json(404, { detail: 'QR token not found' });
         return;
@@ -178,6 +195,7 @@ const cwd = fileURLToPath(new URL('..', import.meta.url));
 const WRANGLER = 'node_modules/wrangler/bin/wrangler.js';
 const worker = spawn(process.execPath, [WRANGLER, 'dev', '--port', String(WORKER_PORT), '--test-scheduled', '--local', '--persist-to', PERSIST,
   '--var', 'TT_API_URL:http://localhost:' + API_PORT,
+  '--var', 'TT_URL:http://localhost:' + DEAD_PORT,
   '--var', 'FIREBASE_API_URL:http://localhost:' + API_PORT], {
   cwd,
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -214,6 +232,15 @@ async function kvGetRecord(endpoint) {
   const got = kvCmd(['kv', 'key', 'get', await kvKey(endpoint), '--text']);
   const out = got.stdout || '';
   return JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1));
+}
+
+async function kvHas(endpoint) {
+  const got = kvCmd(['kv', 'key', 'get', await kvKey(endpoint), '--text']);
+  return (got.stdout || '').includes('"endpoint"');
+}
+
+async function kvPutRecord(endpoint, record) {
+  await kvCmd(['kv', 'key', 'put', await kvKey(endpoint), JSON.stringify(record)]);
 }
 
 // Прибирає з знімка одну оцінку — так, ніби її ще не існувало до цієї хвилини.
@@ -269,7 +296,7 @@ try {
   check('без змін нічого не надсилається', String(received.length), '0');
 
   // Імітуємо нову оцінку: у знімку, який зберіг сервер, прибираємо оцінку
-  // (тобто «до того, як викладач поставив её»). У журналі оцінка вже є —
+  // (тобто «до того, як викладач її поставив»). У журналі оцінка вже є —
   // воркер має побачити різницю і надіслати сповіщення.
   const erased = await eraseOneMark(ENDPOINT);
   check('у знімку є оцінки', String(erased.count > 0), 'true');
@@ -310,7 +337,7 @@ try {
   check('активація QR', actRes.status, 200);
   const act = await actRes.json();
   check('доступ віддано', act.token, 'parent-token-1');
-  check('срок доступу', String(act.expiresIn), '1800');
+  check('термін доступу', String(act.expiresIn), '1800');
 
   check('журнал без доступу → 401', (await fetch(base + '/api/parent/journal')).status, 401);
   check('чужий доступ → 401', (await fetch(base + '/api/parent/journal', {
@@ -347,6 +374,72 @@ try {
     check('у сповіщенні є оцінка', String(payload.body.includes(pErased.mark)), 'true');
     check('посилання веде в батьківський журнал', payload.url, '/#/parent');
   }
+
+  // --- Помилки кабінету та прибирання мертвих підписок ---
+
+  // 422 від FastAPI: detail — масив, а не рядок. String(масив) показав би
+  // користувачеві «[object Object]» замість пояснення.
+  const shortAct = await fetch(base + '/api/parent/activate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({ code: 'abc' }),
+  });
+  check('закороткий код → 422', shortAct.status, 422);
+  const shortTxt = (await shortAct.json()).details || '';
+  check('422 пояснено людині', String(/неповний/.test(shortTxt)), 'true');
+  check('у тексті немає [object Object]', String(/object Object/.test(shortTxt)), 'false');
+
+  // PHP-сайт коледжу урвався на рівні з'єднання: відповідь має бути JSON,
+  // а не падіння воркера з HTML-сторінкою помилки 1101.
+  const downRes = await fetch(base + '/api/groups');
+  check('сервер коледжу ліг → 502', downRes.status, 502);
+  const downBody = await downRes.json();
+  check('502 віддано як JSON', String(/недоступний/.test(downBody.details || '')), 'true');
+
+  const deadSub = await fetch(base + '/api/push/subscribe', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({
+      subscription: { endpoint: ENDPOINT_DEAD, keys: { p256dh: b64uEncode(uaPublicRaw), auth: authSecret } },
+      refreshToken: 'dead-refresh',
+    }),
+  });
+  check('підписка з мертвою сесією → 401', deadSub.status, 401);
+  check('мертву підписку не збережено', String(await kvHas(ENDPOINT_DEAD)), 'false');
+
+  // Якщо токен відкликали вже після підписки — хронологія має прибрати запис,
+  // інакше він назавжди лишається в KV і щопівгодини витрачає квоту списку.
+  const liveSub = await fetch(base + '/api/push/subscribe', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({
+      subscription: { endpoint: ENDPOINT_DEAD, keys: { p256dh: b64uEncode(uaPublicRaw), auth: authSecret } },
+      refreshToken: 'test-refresh',
+    }),
+  });
+  check('підписка з живою сесією', liveSub.status, 200);
+  const doomed = await kvGetRecord(ENDPOINT_DEAD);
+  doomed.refreshToken = 'dead-refresh';
+  doomed.idToken = null;
+  doomed.idTokenExpires = 0;
+  await kvPutRecord(ENDPOINT_DEAD, doomed);
+
+  const before = received.length;
+  await fetch(base + '/__scheduled?cron=23,53');
+  await sleep(5000);
+  check('мертву підписку видалено з KV', String(await kvHas(ENDPOINT_DEAD)), 'false');
+  check('мертва підписка нічого не надіслала', String(received.length), String(before));
+
+  // Знімок старого формату має перезаібратися мовчки: інакше зміна ключа
+  // виглядала б як суцільні нові оцінки й усі отримали б лавину сповіщень.
+  const legacy = await kvGetRecord(ENDPOINT);
+  delete legacy.marksV;
+  await kvPutRecord(ENDPOINT, legacy);
+  await fetch(base + '/__scheduled?cron=23,53');
+  await sleep(5000);
+  const migrated = await kvGetRecord(ENDPOINT);
+  check('старий знімок позначено новою версією', String(migrated.marksV), '2');
+  check('міграція знімка без сповіщень', String(received.length), String(before));
 } catch (e) {
   console.log('ПОМИЛКА: ' + e.stack);
   failed++;

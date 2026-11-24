@@ -150,6 +150,7 @@ body {
 .lesson-hw { margin-top: 4px; font-size: 13px; color: var(--amber); }
 .mark { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 26px; border-radius: 8px; font-weight: 700; font-size: 13px; background: var(--green-bg); color: var(--green); }
 .mark.bad { background: var(--red-bg); color: var(--red); }
+.mark.absent { background: var(--surface-variant); color: var(--muted); padding: 0 7px; }
 
 .news-item img { width: 100%; border-radius: 12px; margin-bottom: 10px; max-height: 180px; object-fit: cover; }
 .news-title { font-weight: 650; margin-bottom: 4px; }
@@ -201,3 +202,129 @@ body {
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.err { background: var(--red); color: #fff; }
+
+/* --- Смуга прокрутки в кольорах застосунку --- */
+* { scrollbar-width: thin; scrollbar-color: var(--primary) var(--surface-variant); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--surface-variant); }
+::-webkit-scrollbar-thumb { background: var(--primary); border-radius: 999px; border: 2px solid var(--surface-variant); }
+::-webkit-scrollbar-thumb:hover { background: var(--green); }
+
+/* --- Запам'ятаний доступ за QR --- */
+.tabbar a { position: relative; }
+.tab-dot {
+  position: absolute; top: 7px; left: calc(50% + 13px);
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 0 2px var(--card);
+}
+.tab-dot[data-state="soon"] { background: var(--amber); }
+.tab-dot[data-state="expired"] { background: var(--red); }
+
+.access-card, .access-out {
+  color: var(--text); font-size: 15px; margin-bottom: 14px;
+  animation: accessIn .28s cubic-bezier(.2, .8, .2, 1);
+}
+@keyframes accessIn { from { opacity: 0; transform: translateY(-6px) scale(.985); } to { opacity: 1; transform: none; } }
+
+.access-card {
+  position: relative; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 16px; padding: 12px 14px 10px 17px;
+  background:
+    radial-gradient(120% 150% at 0% 0%, var(--primary-container) 0%, transparent 58%),
+    radial-gradient(110% 130% at 100% 0%, var(--green-bg) 0%, transparent 52%),
+    var(--card);
+}
+.access-card::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: 4px;
+  background: var(--green); transition: background .3s ease;
+}
+.access-card[data-state="soon"]::after { background: var(--amber); }
+
+.access-top { display: flex; align-items: center; gap: 10px; }
+.access-avatar {
+  flex: 0 0 36px; height: 36px; border-radius: 11px; font-size: 18px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--card); border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .1);
+}
+.access-id { flex: 1; min-width: 0; }
+.access-name { font-weight: 700; font-size: 14.5px; line-height: 1.25; overflow-wrap: anywhere; }
+.access-sub {
+  color: var(--muted); font-size: 11.5px; margin-top: 2px; line-height: 1.35;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.access-pill {
+  flex: 0 0 auto; font-size: 10.5px; font-weight: 700; padding: 3px 8px;
+  border-radius: 999px; white-space: nowrap;
+  background: var(--green-bg); color: var(--green);
+}
+.access-card[data-state="soon"] .access-pill { background: var(--amber-bg); color: var(--amber); }
+
+.access-line { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+.access-meter {
+  flex: 1; min-width: 0; height: 5px; border-radius: 999px; overflow: hidden;
+  background: var(--surface-variant); border: 1px solid var(--border);
+}
+.access-meter[hidden] { display: none; }
+.access-meter i {
+  display: block; height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--green), var(--primary));
+  transition: width 1s linear, background .3s ease;
+}
+.access-card[data-state="soon"] .access-meter i { background: linear-gradient(90deg, var(--amber), var(--red)); }
+
+.access-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.access-count {
+  flex: 0 0 auto; font-size: 12.5px; font-weight: 700;
+  font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap;
+}
+.access-card[data-state="soon"] .access-count { color: var(--amber); }
+.access-push-btn {
+  flex: 0 0 36px; width: 36px; padding: 7px 0; font-size: 15px;
+  transition: background .2s ease, border-color .2s ease, color .2s ease;
+}
+.access-push-btn:hover:not(:disabled) { border-color: var(--primary); }
+.access-push-btn.is-on { background: var(--green-bg); border-color: var(--green); color: var(--green); }
+.access-push-hint { margin-top: 8px; line-height: 1.4; }
+.access-push-hint[hidden] { display: none; }
+
+.access-renew { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); animation: fade .18s ease; }
+.access-renew[hidden] { display: none; }
+
+.access-switch {
+  display: block; width: 100%; margin-top: 8px; padding: 6px 2px 0;
+  background: none; border: 0;
+  color: var(--primary); font: inherit; font-size: 12px; font-weight: 600;
+  text-align: left; text-decoration: none; cursor: pointer;
+}
+.access-switch:hover { text-decoration: underline; }
+
+.access-out {
+  border: 1px solid var(--border); border-radius: 18px; padding: 16px;
+  background: radial-gradient(120% 150% at 100% 0%, var(--primary-container) 0%, transparent 55%), var(--card);
+}
+.access-out-head { display: flex; gap: 12px; align-items: flex-start; }
+.access-out-icon {
+  flex: 0 0 40px; height: 40px; border-radius: 12px; font-size: 20px;
+  display: flex; align-items: center; justify-content: center; background: var(--surface-variant);
+}
+.access-out-head b { font-size: 15.5px; }
+.access-out-head .muted { margin-top: 4px; line-height: 1.5; }
+.access-out-note {
+  margin-top: 12px; padding: 10px 12px; border-radius: 12px;
+  background: var(--surface-variant); line-height: 1.5;
+}
+.access-out-who { margin-top: 10px; }
+.scanner-slot:empty { display: none; }
+
+@media (max-width: 420px) {
+  .access-foot .btn:not(.access-push-btn) { flex: 1; }
+  .access-pill { font-size: 10px; padding: 3px 7px; }
+  .access-avatar { flex-basis: 34px; height: 34px; font-size: 17px; }
+  .access-count { font-size: 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .access-card, .access-out, .access-renew { animation: none; }
+  .access-meter i, .access-card::after, .access-push-btn { transition: none; }
+}

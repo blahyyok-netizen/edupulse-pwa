@@ -95,10 +95,19 @@ function isSameOrigin(request, origin) {
   return !o || o === origin;
 }
 
+// Сервер коледжу час від часу не відповідає на рівні з'єднання (не 5xx, а обрив).
+// Без цього лову воркер падав би з 1101 і віддавав HTML замість JSON.
+const UPSTREAM_DOWN = { error: 'Upstream unavailable', details: 'Сервер коледжу недоступний — спробуйте ще раз' };
+
 async function passThrough(upstream, pathAndQuery, opts = {}) {
   const fetchOpts = Object.assign({}, opts);
   fetchOpts.headers = Object.assign({ 'user-agent': 'okhttp/4.12.0' }, opts.headers || {});
-  const res = await fetch(upstream + pathAndQuery, fetchOpts);
+  let res;
+  try {
+    res = await fetch(upstream + pathAndQuery, fetchOpts);
+  } catch (e) {
+    return json(UPSTREAM_DOWN, 502);
+  }
   const text = await res.text();
   return new Response(text, {
     status: res.status,
@@ -107,6 +116,18 @@ async function passThrough(upstream, pathAndQuery, opts = {}) {
       'cache-control': res.ok ? 'public, max-age=60' : 'no-store',
     },
   });
+}
+
+// FastAPI віддає detail або рядком, або масивом помилок валідації (422).
+// String(масив) дав би «[object Object]» просто в обличчя користувачу.
+function apiDetail(data, fallback) {
+  const d = data && data.detail;
+  if (typeof d === 'string' && d) return d;
+  if (Array.isArray(d)) {
+    const msgs = d.map((e) => (e && e.msg) || '').filter(Boolean);
+    if (msgs.length) return msgs.join('; ');
+  }
+  return fallback;
 }
 
 function assetHeaders(contentType, url) {
@@ -121,14 +142,20 @@ function assetHeaders(contentType, url) {
 // --- Вхід через Google (Firebase) ---
 
 let authConfig = null;
+let authConfigAt = 0;
 
 async function getAuthConfig(env) {
-  if (authConfig) return authConfig;
+  // Кеш із строком життя: якщо кабінет лежав у момент першого запиту, запасні
+  // значення не мають лишитися в ізоляті воркера назавжди.
+  if (authConfig && Date.now() - authConfigAt < 10 * 60 * 1000) return authConfig;
   try {
     const res = await fetch(ttApiBase(env) + '/admin/auth/config');
     if (res.ok) {
       const data = await res.json();
-      if (data && data.workspace_domain) authConfig = data;
+      if (data && data.workspace_domain) {
+        authConfig = data;
+        authConfigAt = Date.now();
+      }
     }
   } catch (e) { }
   if (!authConfig) authConfig = { google_client_id: GOOGLE_CLIENT_ID, workspace_domain: WORKSPACE_DOMAIN };
@@ -304,8 +331,13 @@ async function parentActivate(env, code) {
   if (!res) return { error: 'Сервер коледжу недоступний', status: 502 };
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const known = { 404: 'Коду такого немає — сгенеруйте новий QR (він короткоживучий)', 410: 'Термін дії коду минув — сгенеруйте новий QR' };
-    return { error: known[res.status] || (data.detail && String(data.detail)) || 'Не вдалося активувати код', status: res.status };
+    // 422 = кабінет не прийняв рядок (у схемі qr_token має minLength 10).
+    const known = {
+      404: 'Коду такого немає — сгенеруйте новий QR (він короткоживучий)',
+      410: 'Термін дії коду минув — сгенеруйте новий QR',
+      422: 'Код із QR неповний або пошкоджений — вставте весь рядок цілком',
+    };
+    return { error: known[res.status] || apiDetail(data, 'Не вдалося активувати код'), status: res.status };
   }
   if (!data || !data.parent_access_token) return { error: 'Сервер не повернув доступ', status: 502 };
   return { token: data.parent_access_token, expiresIn: Number(data.expires_in_seconds || 0) || null };
@@ -356,17 +388,24 @@ async function listKvKeys(kv, prefix) {
 // Сесія підписника: id-токен протухає за годину, тож тримаємо в KV і refresh-токен,
 // і оновлений id-токен. Батьківський доступ — окрема гілка: там токен видає сам
 // кабінет і він не оновлюється, бо батько не входить через Google.
+// null = сервер тимчасово недоступний (підписку лишаємо), {dead:true} = доступ
+// справді закінчився (запис можна видаляти).
 async function sessionFor(env, sub) {
   if (sub.parentToken) {
-    if (sub.parentExpires && sub.parentExpires <= Date.now()) return null;
+    if (sub.parentExpires && sub.parentExpires <= Date.now()) return { dead: true };
     return { token: sub.parentToken, changed: false, parent: true };
   }
   if (sub.idToken && sub.idTokenExpires && sub.idTokenExpires > Date.now() + 60000) {
     return { token: sub.idToken, refreshToken: sub.refreshToken, changed: false };
   }
-  if (!sub.refreshToken) return null;
+  if (!sub.refreshToken) return { dead: true };
   const res = await firebaseRefresh(env, sub.refreshToken).catch(() => null);
-  if (!res || !res.ok) return null;
+  if (!res) return null;
+  // 400 від Firebase = refresh-токен відкликаний або прострочений. Інші збої
+  // (5xx, обрив мережі) сесію не вбивають — інакше одна аварія Google знищила б
+  // усі підписки.
+  if (res.status === 400) return { dead: true };
+  if (!res.ok) return null;
   const data = await res.json().catch(() => null);
   if (!data || !data.id_token) return null;
   sub.idToken = data.id_token;
@@ -380,6 +419,10 @@ async function sessionFor(env, sub) {
 // частин — інакше одна й та сама пара щоразу виглядала б як «нова оцінка».
 const FS = '\u001f';
 const RS = '\u001e';
+// Формат ключа знімка. Назва предмета в ключі обов'язкова: кабінет може не дати
+// discipline_id, і тоді два різні предмети з тією самою датою злиплися б в один
+// запис, а сповіщення назвало б чужий предмет.
+const MARKS_V = 2;
 
 function collectMarks(journal) {
   const marks = {};
@@ -395,7 +438,7 @@ function collectMarks(journal) {
         e.type || '',
         e.mark && e.mark.value ? String(e.mark.value) : '',
       ].join(FS)).sort();
-      const key = [s.date || '', d.discipline_id ?? '', s.pair_number ?? ''].join('|');
+      const key = [s.date || '', d.discipline_id ?? '', d.discipline || '', s.pair_number ?? ''].join('|');
       marks[key] = marks[key] ? marks[key].split(RS).concat(parts).sort().join(RS) : parts.join(RS);
       meta[key] = { discipline: d.discipline || 'Предмет', date: s.date || '', pair: s.pair_number };
     });
@@ -404,7 +447,7 @@ function collectMarks(journal) {
 }
 
 // Лишаємо останні N записів (ключ починається з дати, тож порядок — хронологічний).
-// Важливо не різати за «сьогодні»: у学期і журнал може не оновлюватись місяцями,
+// Важливо не різати за «сьогодні»: у семестрі журнал може не оновлюватись місяцями,
 // і тоді знімок спорожніє, а перша перевірка пришле купу «нових» оцінок.
 function pruneMarks(marks) {
   const keys = Object.keys(marks).sort();
@@ -418,7 +461,9 @@ function pushText(change) {
   const m = change.meta;
   const date = /^\d{4}-\d{2}-\d{2}$/.test(m.date) ? m.date.slice(8) + '.' + m.date.slice(5, 7) : '';
   const pair = m.pair ? ', ' + m.pair + ' пара' : '';
-  const mark = change.value === 'нб' ? 'не був' : 'оцінка ' + change.value;
+  // «нб» і «нбп» — це відсутність, а не оцінка (так їх пояснює застосунок коледжу).
+  const v = String(change.value).toLowerCase();
+  const mark = v === 'нб' ? 'не був' : v === 'нбп' ? 'не був з поважної причини' : 'оцінка ' + change.value;
   const what = m.kind === 'assessment' ? (m.type || 'оцінювання') : '';
   return m.discipline + (date ? ' (' + date + pair + ')' : '') + ' — ' + mark + (what ? ', ' + what : '');
 }
@@ -480,6 +525,13 @@ async function checkSubscription(env, sub, keyPair, journal) {
   const prevCount = Object.keys(prev).length;
   const newCount = Object.keys(marks).length;
 
+  // Знімок старого формату: ключі інші, тож різниця була б суцільною.
+  // Перезбираємо його мовчки — інакше всі підписники отримали б лавину сповіщень.
+  if (sub.marksV !== MARKS_V) {
+    sub.marks = pruneMarks(marks);
+    sub.marksV = MARKS_V;
+    return { dead: false, changed: true, notify: false };
+  }
   // Базового знімка ще немає — зберігаємо його мовчки, без сповіщень.
   if (!prevCount) {
     sub.marks = pruneMarks(marks);
@@ -565,10 +617,17 @@ export default {
           parentToken: parentToken || null,
           parentExpires: parentToken ? Number(body.parentExpires || 0) || 0 : 0,
           createdAt: Date.now(),
+          marksV: MARKS_V,
           marks: {},
         };
         // Базовий знімок журналу: щоб перша перевірка не повідомила про всю історію.
         const session = await sessionFor(env, record);
+        if (session && session.dead) {
+          return json({
+            error: 'Session expired',
+            details: parentToken ? 'Доступ завершився — потрібен новий QR' : 'Сесія недійсна — увійдіть знову',
+          }, 401);
+        }
         if (session) {
           const journal = session.parent
             ? await fetchParentJournal(env, session.token)
@@ -692,7 +751,8 @@ export default {
           return json({ error: 'Bad request', details: 'Некоректний запит' }, 400);
         }
         if (!body || !body.refreshToken) return json({ error: 'refreshToken required', details: 'Немає refresh-токена' }, 400);
-        const res = await firebaseRefresh(env, body.refreshToken);
+        const res = await firebaseRefresh(env, body.refreshToken).catch(() => null);
+        if (!res) return json(UPSTREAM_DOWN, 502);
         const data = await res.json().catch(() => null);
         if (!res.ok || !data) return json({ error: 'Refresh failed', details: 'Не вдалося оновити сесію' }, res.status || 500);
         return json({
@@ -708,7 +768,8 @@ export default {
         if (!token) return json({ error: 'Sign in required', details: 'Спершу увійдіть' }, 401);
         const res = await fetch(ttApiBase(env) + '/journal/me', {
           headers: { authorization: 'Bearer ' + token, 'user-agent': 'okhttp/4.12.0' },
-        });
+        }).catch(() => null);
+        if (!res) return json(UPSTREAM_DOWN, 502);
         if (res.status === 401) return json({ error: 'Sign in required', details: 'Сесія завершилась — увійдіть знову' }, 401);
         if (res.status === 403) return json({ error: 'Journal not allowed', details: 'Цей акаунт не має доступу до журналу' }, 403);
         const data = await res.json().catch(() => null);
@@ -805,11 +866,13 @@ export default {
       }
       try {
         const session = await sessionFor(env, sub);
-        if (!session) {
-          // Батьківський доступ минув — підписка більше нічого не може перевірити.
-          if (sub.parentToken) await env.PUSH_SUBS.delete(name);
+        // Доступ справді закінчився — запис нічого вже не перевірить, а місце в KV
+        // і квоту списку витрачає щопівгодини.
+        if (session && session.dead) {
+          await env.PUSH_SUBS.delete(name);
           continue;
         }
+        if (!session) continue;
         let journal;
         if (session.parent) {
           const r = await parentJournal(env, session.token);

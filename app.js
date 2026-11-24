@@ -5,7 +5,9 @@ const LS = {
   lastName: 'ep_lastname', firstName: 'ep_firstname',
   token: 'ep_token', refresh: 'ep_refresh', expires: 'ep_expires', email: 'ep_email',
   parentToken: 'ep_parent_token', parentExpires: 'ep_parent_expires',
-  pushKind: 'ep_push_kind',
+  parentTtl: 'ep_parent_ttl', parentLabel: 'ep_parent_label', parentSeen: 'ep_parent_seen',
+  journalMode: 'ep_journal_mode',
+  pushKind: 'ep_push_kind', pushEndpoint: 'ep_push_endpoint',
   sched: (k, d) => 'ep_sched_' + k + '_' + d,
   journal: 'ep_journal',
   journalParent: 'ep_journal_parent',
@@ -35,6 +37,10 @@ const state = {
   email: localStorage.getItem(LS.email) || '',
   parentToken: localStorage.getItem(LS.parentToken) || null,
   parentExpiresAt: Number(localStorage.getItem(LS.parentExpires) || 0),
+  parentTtl: Number(localStorage.getItem(LS.parentTtl) || 0),
+  parentLabel: localStorage.getItem(LS.parentLabel) || '',
+  parentSeenAt: Number(localStorage.getItem(LS.parentSeen) || 0),
+  journalMode: localStorage.getItem(LS.journalMode) || '',
 };
 
 function readJson(key, fallback) {
@@ -67,6 +73,7 @@ function cacheGet(key, ttl) {
 }
 
 function saveAuth(data) {
+  const prevEmail = state.email;
   state.token = data.idToken;
   state.refreshToken = data.refreshToken || state.refreshToken;
   state.expiresAt = Date.now() + (Number(data.expiresIn || 3600) - 60) * 1000;
@@ -75,10 +82,14 @@ function saveAuth(data) {
   localStorage.setItem(LS.refresh, state.refreshToken || '');
   localStorage.setItem(LS.expires, String(state.expiresAt));
   if (data.email) localStorage.setItem(LS.email, data.email);
+  // Зайшли іншим акаунтом — сповіщення мають перевіряти його журнал, не попередній.
+  if (data.email && prevEmail && data.email !== prevEmail) resyncPush('student');
 }
 
 async function logout() {
-  await unregisterPush();
+  // Підписка на цьому телефоні належить або студентові, або батькові. Вихід
+  // студента не має забирати сповіщення батьківського журналу.
+  if (pushKind() === 'student') await unregisterPush();
   // Спершу виходимо з Firebase, інакше спостерігач за авторизацією одразу
   // підлогінить користувача назад.
   signInBusy = true;
@@ -87,11 +98,12 @@ async function logout() {
       await firebase.auth().signOut();
     }
   } catch (e) { }
-  [LS.token, LS.refresh, LS.expires, LS.email, LS.journal].forEach((k) => localStorage.removeItem(k));
+  [LS.token, LS.refresh, LS.expires, LS.email, LS.journal, LS.journalMode].forEach((k) => localStorage.removeItem(k));
   state.token = null;
   state.refreshToken = null;
   state.expiresAt = 0;
   state.email = '';
+  state.journalMode = '';
   signInBusy = false;
 }
 
@@ -102,13 +114,43 @@ async function logout() {
 // телефоні — зокрема на iPhone, офіційного застосунку для якого немає.
 
 function saveParent(data) {
+  const prevToken = state.parentToken;
   state.parentToken = data.token;
   const ttl = Number(data.expiresIn || 0);
-  state.parentExpiresAt = ttl > 0 ? Date.now() + (ttl - 60) * 1000 : 0;
+  state.parentTtl = ttl;
+  // Запас проти годинника пристрою, але не більший за десяту частину строку:
+  // для короткого доступа фіксована хвилина зробила б токен мертвим одразу.
+  const margin = Math.min(60, Math.floor(ttl * 0.1));
+  state.parentExpiresAt = ttl > 0 ? Date.now() + (ttl - margin) * 1000 : 0;
   localStorage.setItem(LS.parentToken, state.parentToken);
   localStorage.setItem(LS.parentExpires, String(state.parentExpiresAt));
+  localStorage.setItem(LS.parentTtl, String(ttl));
+  if (data.label) setParentLabel(data.label);
   // Кеш попереднього доступу не повинен показатися новому.
-  localStorage.removeItem(LS.journalParent);
+  if (prevToken && prevToken !== data.token) localStorage.removeItem(LS.journalParent);
+  // Новий QR — новий токен. Без цього сервер і далі перевіряв би старий доступ,
+  // отримав би 401 і видалив підписку, а інтерфейс показував би «увімкнено».
+  if (prevToken !== data.token) resyncPush('parent');
+}
+
+function setParentLabel(label) {
+  const text = String(label || '').trim().slice(0, 80);
+  if (!text) return;
+  state.parentLabel = text;
+  localStorage.setItem(LS.parentLabel, text);
+}
+
+// Доступ минув, але журнал лишається: людина вже одного разу показала QR, тож
+// останні відомі оцінки мають бути на екрані, а не зникати разом із токеном.
+function expireParent() {
+  state.parentToken = null;
+  state.parentExpiresAt = 0;
+  state.parentTtl = 0;
+  [LS.parentToken, LS.parentExpires, LS.parentTtl].forEach((k) => localStorage.removeItem(k));
+  if (pushKind() === 'parent') {
+    unregisterPush();
+    setPushKind('');
+  }
 }
 
 async function unlinkParent() {
@@ -123,9 +165,13 @@ async function unlinkParent() {
     await unregisterPush();
     setPushKind('');
   }
-  [LS.parentToken, LS.parentExpires, LS.journalParent].forEach((k) => localStorage.removeItem(k));
+  [LS.parentToken, LS.parentExpires, LS.parentTtl, LS.parentLabel, LS.parentSeen, LS.journalParent]
+    .forEach((k) => localStorage.removeItem(k));
   state.parentToken = null;
   state.parentExpiresAt = 0;
+  state.parentTtl = 0;
+  state.parentLabel = '';
+  state.parentSeenAt = 0;
 }
 
 async function unregisterPush() {
@@ -136,12 +182,22 @@ async function unregisterPush() {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ endpoint }),
   }).catch(() => null);
+  // Запису на сервері вже немає — інтерфейс не має й далі показувати «Вимкнути».
+  push.subscription = null;
+  setPushKind('');
+  localStorage.removeItem(LS.pushEndpoint);
 }
 
 async function api(path, opts = {}) {
+  // Токен потрібен лише журналу. Чіпляти його до публічних запитів не можна:
+  // service worker не кешує відповіді на запити з authorization, тож офлайн
+  // ламався б саме в увійденого користувача — розклад без груп і без кешу.
   const doFetch = () => fetch(path, {
     ...opts,
-    headers: { ...(opts.headers || {}), ...(state.token ? { authorization: 'Bearer ' + state.token } : {}) },
+    headers: {
+      ...(opts.headers || {}),
+      ...(path.startsWith('/api/journal') && state.token ? { authorization: 'Bearer ' + state.token } : {}),
+    },
   });
   let res = await doFetch();
   if (res.status === 401 && state.refreshToken) {
@@ -215,7 +271,10 @@ function setView(name) {
   document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
   const target = $('view-' + name);
   if (target) target.classList.add('active');
-  document.querySelectorAll('.tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.tab === name));
+  // Батьківський екран відкривається з «Ще» — окремої вкладки в нього немає,
+  // тож підсвічуємо «Ще», інакше внизу не світилося б нічого.
+  const tab = name === 'parent' ? 'more' : name;
+  document.querySelectorAll('.tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.tab === tab));
   window.scrollTo(0, 0);
 }
 
@@ -231,6 +290,7 @@ async function loadGroups(select, withFaculties) {
     }
   }
   fillWho(select, withFaculties);
+  return state.groups.length > 0;
 }
 
 async function loadTeachers(select) {
@@ -239,6 +299,7 @@ async function loadTeachers(select) {
     if (data && Array.isArray(data.teachers)) state.teachers = data.teachers;
   }
   fillWho(select, false);
+  return state.teachers.length > 0;
 }
 
 function fillWho(select, withFaculties) {
@@ -333,14 +394,27 @@ function renderCalendar() {
   });
 }
 
+// Читання кешу без видалення: прострочений запис ще знадобиться як запасний,
+// коли сервер не відповідає. cacheGet() натомість одразу його стирає.
+function cachePeek(key) {
+  try {
+    const box = JSON.parse(localStorage.getItem(key) || 'null');
+    return box && box.d !== undefined ? box.d : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function fetchDates() {
+  // Запасний список читаємо ДО cacheGet: той стирає прострочений запис.
+  const stale = cachePeek('ep_dates');
   const cached = cacheGet('ep_dates', TTL.dates);
   if (cached) return cached;
   const data = await apiJson('/api/dates');
   const list = data && Array.isArray(data.dates) ? data.dates.slice().sort() : [];
   if (!list.length) {
-    const fallback = cacheGet('ep_dates', 7 * 24 * 60 * 60 * 1000);
-    return fallback || list;
+    // Сервер не віддав дат — беремо останні відомі, хай і старіші за 15 хвилин.
+    return (Array.isArray(stale) && stale.length) ? stale : list;
   }
   return cacheSet('ep_dates', list, TTL.dates);
 }
@@ -357,8 +431,16 @@ function pickDate(list, today) {
 async function renderSchedule() {
   const select = $('whoSel');
   document.querySelectorAll('.seg').forEach((b) => b.classList.toggle('active', b.dataset.mode === state.mode));
-  if (state.mode === 'student') await loadGroups(select);
-  else await loadTeachers(select);
+  const isTeacher = state.mode === 'teacher';
+  const loaded = isTeacher ? await loadTeachers(select) : await loadGroups(select);
+  // Порожній список — це не «обери групу», це сервер не відповів. Так і кажемо.
+  if (!loaded) {
+    clear($('tProgress'));
+    empty($('scheduleList'), isTeacher
+      ? 'Не вдалося завантажити викладачів — сервер коледжу недоступний'
+      : 'Не вдалося завантажити групи — сервер коледжу недоступний');
+    return;
+  }
 
   const key = state.mode === 'teacher' ? 't:' + (select.value || '') : 'g:' + (select.value || '') ;
   if (!select.value) {
@@ -684,7 +766,11 @@ function journalHead() {
       : '<div class="muted small" style="margin-top:6px">Журнал лежить у кабінеті коледжу й віддається лише після входу. Увійдіть своїм акаунтом Google — журнал і сповіщення про нові оцінки запрацюють.</div>';
     return '<div class="card"><b>Журнал потребує входу</b>' + note +
       '<div id="gSignIn" style="display:flex;justify-content:center;margin-top:14px">' +
-      '<button id="fbSignIn" class="btn">' + (blocked ? 'Спробувати ще раз' : 'Увійти через Google') + '</button></div></div>';
+      '<button id="fbSignIn" class="btn">' + (blocked ? 'Спробувати ще раз' : 'Увійти через Google') + '</button></div>' +
+      (hasRememberedJournal() || state.parentToken
+        ? '<button id="journalQrSwitch" class="access-switch">← Журнал за QR, запам’ятаний на цьому пристрої</button>'
+        : '<a class="access-switch" href="#/parent">Немає Google? Журнал за QR від студента →</a>') +
+      '</div>';
   }
   return '<div class="row" style="align-items:center;margin-bottom:0">' +
     '<span class="muted small" id="whoami">' + esc(state.email || 'Ви увійшли') + '</span>' +
@@ -693,24 +779,54 @@ function journalHead() {
     '<div class="muted small" id="pushHint" style="margin-top:6px"></div>';
 }
 
+function wireJournalOut() {
+  if ($('fbSignIn')) $('fbSignIn').onclick = signInWithGoogle;
+  const back = $('journalQrSwitch');
+  if (back) back.onclick = () => {
+    state.journalMode = '';
+    localStorage.removeItem(LS.journalMode);
+    renderJournal();
+  };
+}
+
+// Запам'ятаний QR перемагає стіну входу Google: людина вже одного разу показала
+// код, тож «Журнал» має відкрити її оцінки, а не знову просити акаунт.
+function journalUsesParent() {
+  return !state.token && state.journalMode !== 'student' &&
+    (!!state.parentToken || hasRememberedJournal());
+}
+
 async function renderJournal() {
   const el = $('journalList');
   const head = $('journalHead');
+  updateJournalDot();
+  if (journalUsesParent()) {
+    paintAccessHead(head, { studentSwitch: true });
+    await loadParentJournal(el);
+    return;
+  }
+  unmountScanner();
+  stopAccessTimer();
+  // Картка QR лишається лише на одному екрані: прихований заголовок інакше
+  // тримав би старі ID, і відлік знаходив би картку, якої на екрані немає.
+  const other = $('parentHead');
+  if (other) { other.innerHTML = ''; other.dataset.mode = ''; }
   const mode = state.token ? 'in' : 'out';
   if (head.dataset.mode !== mode) {
-    if (!state.token) {
-      // Домен має бути дозволений у Firebase-проєкті коледжу — інакше вхід не
-      // завершиться, тож показуємо це одразу, а не через кілька хвилин.
-      // Сам SDK Firebase для перевірки не потрібен — достатньо конфігурації.
-      await refreshFirebaseConfig().catch(() => { });
-    }
     head.innerHTML = journalHead();
     head.dataset.mode = mode;
     if (state.token) {
       $('logoutBtn').onclick = async () => { await logout(); renderJournal(); };
       $('pushBtn').onclick = () => (pushOn('student') ? disablePush() : enablePush('student'));
-    } else if ($('fbSignIn')) {
-      $('fbSignIn').onclick = signInWithGoogle;
+    } else {
+      wireJournalOut();
+      // Стіна входу має з'явитися одразу, навіть якщо мережа повільна: пояснення
+      // про домен Firebase дожене її окремо, а не тримати екран у старому стані.
+      refreshFirebaseConfig().then(() => {
+        if (signInBusy || state.token || head.dataset.mode !== 'out') return;
+        head.innerHTML = journalHead();
+        wireJournalOut();
+      }).catch(() => { });
     }
   }
   if (!state.token) {
@@ -761,10 +877,20 @@ function drawJournal(data, fromCache, el) {
     const lessons = sessions.map((ses) => {
       const date = prettyDate(ses.date || '') + (ses.pair_number ? ', ' + ses.pair_number + ' пара' : '');
       return (ses.entries || []).map((en) => {
-        const mk = en.mark && en.mark.value ? '<span class="mark' + (Number(en.mark.value) < 3 ? ' bad' : '') + '">' + esc(en.mark.value) + '</span>' : '';
+        const raw = en.mark && en.mark.value ? String(en.mark.value) : '';
+        // «нб» і «нбп» — відсутність, а не оцінка: їх не можна ні фарбувати в
+        // червоне, ні тягнути в середній бал (так їх пояснює застосунок коледжу).
+        const absent = /^(нб|нбп)$/i.test(raw);
+        const why = raw.toLowerCase() === 'нбп' ? 'Не був з поважної причини' : 'Не був на занятті';
+        const mk = raw
+          ? '<span class="mark' + (absent ? ' absent' : (Number(raw) < 3 ? ' bad' : '')) + '"' +
+            (absent ? ' title="' + why + '"' : '') + '>' + esc(raw) + '</span>'
+          : '';
+        const comment = en.mark && en.mark.comment ? String(en.mark.comment) : '';
         const kind = en.kind === 'assessment' ? 'оцінка' : (en.type || '');
         return '<div class="lesson"><div class="lesson-top"><span class="lesson-date">' + esc(date) + (kind ? ' · ' + esc(kind) : '') + '</span>' + mk + '</div>' +
           (en.topic ? '<div class="lesson-topic">' + esc(en.topic) + '</div>' : '') +
+          (comment ? '<div class="lesson-hw muted">Викладач: ' + esc(comment) + '</div>' : '') +
           (en.homework ? '<div class="lesson-hw">ДЗ: ' + esc(en.homework) + '</div>' : '') +
           (en.self_study ? '<div class="lesson-hw muted">Самостійно: ' + esc(en.self_study) + '</div>' : '') + '</div>';
       }).join('');
@@ -788,6 +914,9 @@ const scan = {
   ctx: null,
   detector: null,
   busy: false,
+  // Лічильник запусків: камера йде через кілька await, і за цей час користувач
+  // може піти з екрана. Без нього інтервал заводився після stopScan() і жив вічно.
+  seq: 0,
 };
 
 let activateBusy = false;
@@ -797,6 +926,9 @@ let activateBusy = false;
 function qrTokenFrom(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
+  // decodeURIComponent кидає URIError на «%» без двох шістнадцяткових цифр після
+  // нього. У скопійованому посиланні таке буває — і кнопка просто мовчала б.
+  const dec = (v) => { try { return decodeURIComponent(v); } catch (e) { return v; } };
   if (s[0] === '{') {
     try {
       const o = JSON.parse(s);
@@ -804,71 +936,263 @@ function qrTokenFrom(raw) {
     } catch (e) { }
   }
   const q = /[?&](?:qr_token|qrToken|token|code)=([^&#\s]+)/.exec(s);
-  if (q) return decodeURIComponent(q[1]);
+  if (q) return dec(q[1]);
   if (/^https?:\/\//i.test(s)) {
     const parts = s.split('#')[0].split('?')[0].split('/').filter(Boolean);
-    return decodeURIComponent(parts[parts.length - 1] || '');
+    return dec(parts[parts.length - 1] || '');
   }
   return s;
 }
 
-function parentHead() {
-  if (!state.parentToken) return '';
-  const ttl = state.parentExpiresAt
-    ? new Date(state.parentExpiresAt).toLocaleString('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
-    : '';
-  return '<div class="row" style="align-items:center;margin-bottom:0">' +
-    '<span class="muted small">Журнал студента — доступ за QR' + (ttl ? ', до ' + esc(ttl) : '') + '</span>' +
-    '<button id="parentUnlink" class="btn ghost small-btn" style="margin-left:auto">Відв’язати</button></div>' +
-    '<div class="row" style="margin-top:16px;margin-bottom:0"><button id="pPushBtn" class="btn ghost block">🔔 Увімкнути сповіщення</button></div>' +
-    '<div class="muted small" id="pPushHint" style="margin-top:6px"></div>';
+// --- Запам'ятаний доступ за QR ---
+// Один скан — і журнал лишається на пристрої: вкладка «Журнал» відкриває його
+// без Google, доки діє токен. Коли токен минає, оцінки не зникають — вони
+// показані з кешу, а згори одразу лежить сканер для нового QR.
+
+const ACCESS_SOON_MS = 5 * 60 * 1000;
+
+function hasRememberedJournal() {
+  return !!state.parentLabel || !!cachePeek(LS.journalParent);
 }
 
-function scanCard() {
-  return '<div class="card">' +
-    '<b>Журнал для батьків</b>' +
-    '<div class="muted small" style="margin-top:6px;line-height:1.5">Студент відкриває застосунок коледжу на Android → «Для батьків» → показує QR. Код діє кілька хвилин, тому скануйте одразу, як його побачили.</div>' +
-    '<div class="row" style="margin:14px 0 0"><button id="scanBtn" class="btn block">📷 Сканувати камерою</button></div>' +
-    '<video id="scanVideo" class="scan-video" playsinline muted></video>' +
-    '<div class="muted small" id="scanHint" style="margin-top:6px"></div>' +
-    '<div class="row" style="margin:14px 0 0"><input id="codeInput" class="input" placeholder="…або вставте код із QR" autocomplete="off" autocapitalize="off" spellcheck="false"></div>' +
-    '<div class="row" style="margin-top:10px;margin-bottom:0"><button id="codeBtn" class="btn ghost block">Відкрити журнал</button></div>' +
+function parentSession() {
+  if (!state.parentToken) return { status: 'none', left: 0, pct: 0, known: false };
+  if (!state.parentExpiresAt) return { status: 'ok', left: 0, pct: 100, known: false };
+  const left = state.parentExpiresAt - Date.now();
+  if (left <= 0) return { status: 'expired', left: 0, pct: 0, known: true };
+  const total = state.parentTtl > 0 ? state.parentTtl * 1000 : left;
+  const pct = Math.max(0, Math.min(100, (left / total) * 100));
+  const soonAt = Math.min(ACCESS_SOON_MS, total * 0.25);
+  return { status: left <= soonAt ? 'soon' : 'ok', left, pct, known: true };
+}
+
+function leftText(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const p2 = (n) => String(n).padStart(2, '0');
+  if (d) return d + ' дн ' + h + ' год';
+  if (h) return h + ' год ' + p2(m) + ' хв';
+  if (m) return m + ' хв ' + p2(sec) + ' с';
+  return sec + ' с';
+}
+
+function seenText() {
+  if (!state.parentSeenAt) return '';
+  return new Date(state.parentSeenAt).toLocaleString('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function accessCardHtml(opts) {
+  const s = parentSession();
+  const name = state.parentLabel || 'Журнал студента';
+  const seen = seenText();
+  // Картка — статус-смуга, а не герой екрана: оцінки мають бути видно одразу,
+  // тому відлік стоїть біля шкали, а дії — в один рядок.
+  return '<div class="access-card" id="accessCard" data-state="' + s.status + '">' +
+    '<div class="access-top">' +
+      '<div class="access-avatar" aria-hidden="true">' + (state.parentLabel ? '🎓' : '👪') + '</div>' +
+      '<div class="access-id">' +
+        '<div class="access-name" id="accessName">' + esc(name) + '</div>' +
+        '<div class="access-sub" id="accessSub">' + (seen ? 'Оновлено ' + esc(seen) : 'Запам’ятано на цьому пристрої') + '</div>' +
+      '</div>' +
+      '<span class="access-pill" id="accessPill">' + (s.status === 'soon' ? 'Завершується' : 'Активний') + '</span>' +
+    '</div>' +
+    '<div class="access-line">' +
+      '<div class="access-meter" id="accessMeterWrap" role="progressbar" aria-label="Залишок часу доступу" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + Math.round(s.pct) + '"><i id="accessMeter" style="width:' + s.pct.toFixed(2) + '%"></i></div>' +
+      '<span class="access-count" id="accessCount"></span>' +
+    '</div>' +
+    '<div class="access-foot">' +
+      '<button id="accessRenew" class="btn tonal small-btn">Оновити доступ</button>' +
+      '<button id="pPushBtn" class="btn ghost small-btn access-push-btn" data-icon="1" aria-label="Сповіщення про нові оцінки">🔔</button>' +
+      '<button id="parentUnlink" class="btn ghost small-btn">Відв’язати</button>' +
+    '</div>' +
+    '<div class="muted small access-push-hint" id="pPushHint" hidden></div>' +
+    '<div class="access-renew" id="accessRenewBox" hidden></div>' +
+    (opts.studentSwitch ? '<button id="journalGoogleSwitch" class="access-switch">Ви студент? Увійти через Google →</button>' : '') +
     '</div>';
 }
 
-async function renderParent() {
-  const head = $('parentHead');
-  const box = $('scanBox');
-  const el = $('parentList');
-  const mode = state.parentToken ? 'in' : 'out';
-  if (head.dataset.mode !== mode) {
-    head.innerHTML = parentHead();
-    head.dataset.mode = mode;
-    if (state.parentToken) {
-      box.innerHTML = '';
-      stopScan();
-      $('parentUnlink').onclick = async () => {
-        await unlinkParent();
-        toast('Доступ відв’язано');
-        renderParent();
-      };
-      $('pPushBtn').onclick = () => (pushOn('parent') ? disablePush() : enablePush('parent'));
-    } else {
-      clear(el);
-      if (!box.innerHTML) box.innerHTML = scanCard();
-      $('scanBtn').onclick = () => (scan.stream ? stopScan() : startScan());
-      $('codeBtn').onclick = () => {
-        const input = $('codeInput');
-        const code = qrTokenFrom(input.value);
-        if (!code) { toast('Немає кода', 'err'); return; }
-        input.value = '';
-        activateParentCode(code);
-      };
-    }
+function accessOutHtml(expired, opts) {
+  return '<div class="card access-out" id="accessOut">' +
+    '<div class="access-out-head">' +
+      '<span class="access-out-icon" aria-hidden="true">' + (expired ? '⌛' : '👪') + '</span>' +
+      '<div><b>' + (expired ? 'Доступ завершився' : 'Журнал без Google') + '</b>' +
+      '<div class="muted small">' + (expired
+        ? 'Збережені оцінки лишилися нижче. Відскануйте новий QR — журнал оновиться сам.'
+        : 'Відскануйте QR один раз — журнал запам’ятається на цьому пристрої й відкриватиметься сам, без входу Google.') + '</div></div>' +
+    '</div>' +
+    '<div class="access-out-note muted small">Студент відкриває застосунок коледжу на Android → «Для батьків» → показує QR. Код діє кілька хвилин, тому скануйте одразу, як його побачили.</div>' +
+    '<div class="scanner-slot"></div>' +
+    (expired && state.parentLabel ? '<div class="access-out-who muted small">Останній журнал: <b>' + esc(state.parentLabel) + '</b></div>' : '') +
+    (opts && opts.studentSwitch ? '<button id="journalGoogleSwitch" class="access-switch">Ви студент? Увійти через Google →</button>' : '') +
+    '</div>';
+}
+
+function scanCard() {
+  return '<div class="row" style="margin:14px 0 0"><button id="scanBtn" class="btn block">📷 Сканувати камерою</button></div>' +
+    '<video id="scanVideo" class="scan-video" playsinline muted></video>' +
+    '<div class="muted small" id="scanHint" style="margin-top:6px"></div>' +
+    '<div class="row" style="margin:14px 0 0"><input id="codeInput" class="input" placeholder="…або вставте код із QR" aria-label="Код із QR" autocomplete="off" autocapitalize="off" spellcheck="false"></div>' +
+    '<div class="row" style="margin-top:10px;margin-bottom:0"><button id="codeBtn" class="btn ghost block">Відкрити журнал</button></div>';
+}
+
+// Сканер у документі один: його вузол переїжджає між екранами, тож ID камери,
+// поля коду й кнопки ніколи не дублюються — інакше getElementById брав би чужий.
+let scannerEl = null;
+
+function scannerNode() {
+  if (scannerEl) return scannerEl;
+  const wrap = document.createElement('div');
+  wrap.className = 'scanner';
+  wrap.innerHTML = scanCard();
+  scannerEl = wrap;
+  wrap.querySelector('#scanBtn').onclick = () => (scan.stream ? stopScan() : startScan());
+  wrap.querySelector('#codeBtn').onclick = () => {
+    const input = wrap.querySelector('#codeInput');
+    const code = qrTokenFrom(input.value);
+    if (!code) { toast('Немає кода', 'err'); return; }
+    input.value = '';
+    activateParentCode(code);
+  };
+  return wrap;
+}
+
+function mountScanner(target, hint) {
+  if (!target) return;
+  const node = scannerNode();
+  if (node.parentNode !== target) target.appendChild(node);
+  // Вузол сканера один і живе між екранами: після успішної активації маршрут
+  // перебудував екран раніше, ніж finally повернув кнопку, тож без цього
+  // наступне відкриття сканера показало б «Перевіряємо код…» назавжди.
+  const btn = node.querySelector('#codeBtn');
+  btn.disabled = false;
+  btn.textContent = 'Відкрити журнал';
+  node.querySelector('#codeInput').value = '';
+  scanHint(hint || '');
+}
+
+function unmountScanner() {
+  stopScan();
+  if (scannerEl && scannerEl.parentNode) scannerEl.remove();
+}
+
+let accessTimer = null;
+
+function stopAccessTimer() {
+  if (accessTimer) { clearInterval(accessTimer); accessTimer = null; }
+}
+
+function startAccessTimer() {
+  stopAccessTimer();
+  tickAccess();
+  if (state.parentToken && state.parentExpiresAt) accessTimer = setInterval(tickAccess, 1000);
+}
+
+function tickAccess() {
+  const card = $('accessCard');
+  if (!card) { stopAccessTimer(); return; }
+  const s = parentSession();
+  if (s.status === 'expired') {
+    stopAccessTimer();
+    expireParent();
+    updateJournalDot();
+    toast('Доступ завершився — потрібен новий QR', 'err');
+    route();
+    return;
   }
-  if (!state.parentToken) return;
+  card.dataset.state = s.status;
+  updateJournalDot();
+  const pill = $('accessPill');
+  if (pill) pill.textContent = s.status === 'soon' ? 'Завершується' : 'Активний';
+  const count = $('accessCount');
+  if (count) count.textContent = s.known ? 'Залишилось ' + leftText(s.left) : 'Термін доступу невідомий';
+  const meter = $('accessMeter');
+  if (meter) meter.style.width = s.pct.toFixed(2) + '%';
+  const wrap = $('accessMeterWrap');
+  if (wrap) {
+    wrap.setAttribute('aria-valuenow', String(Math.round(s.pct)));
+    wrap.hidden = !s.known;
+  }
+}
+
+// Малює картку доступу в заданий заголовок. Одночасно вона лише одна: картка
+// іншого екрана прибирається, щоб у документі не з'явилися однакові ID.
+function paintAccessHead(head, opts) {
+  // Прострочений токен прибираємо до малювання: інакше картка з'явиться на
+  // мить і одразу перебудується відліком, а маршрут викличе сам себе.
+  if (state.parentToken && parentSession().status === 'expired') expireParent();
+  ['journalHead', 'parentHead'].forEach((id) => {
+    const h = $(id);
+    if (h && h !== head) { h.innerHTML = ''; h.dataset.mode = ''; }
+  });
+  const box = $('scanBox');
+  if (box) box.innerHTML = '';
+  unmountScanner();
+  stopAccessTimer();
+
+  if (state.parentToken) {
+    head.dataset.mode = 'qr-in';
+    head.innerHTML = accessCardHtml(opts);
+    $('parentUnlink').onclick = async () => {
+      const btn = $('parentUnlink');
+      btn.disabled = true;
+      await unlinkParent();
+      updateJournalDot();
+      toast('Доступ відв’язано');
+      route();
+    };
+    $('pPushBtn').onclick = () => (pushOn('parent') ? disablePush() : enablePush('parent'));
+    $('accessRenew').onclick = () => {
+      const renew = $('accessRenewBox');
+      const open = renew.hidden;
+      renew.hidden = !open;
+      $('accessRenew').textContent = open ? 'Сховати сканер' : 'Оновити доступ';
+      if (open) mountScanner(renew, 'Наведіть на новий QR або вставте код — журнал оновиться сам.');
+      else unmountScanner();
+    };
+    startAccessTimer();
+  } else {
+    head.dataset.mode = 'qr-out';
+    head.innerHTML = accessOutHtml(hasRememberedJournal(), opts);
+    mountScanner(head.querySelector('.scanner-slot'), '');
+  }
+
+  const sw = $('journalGoogleSwitch');
+  if (sw) sw.onclick = () => {
+    state.journalMode = 'student';
+    localStorage.setItem(LS.journalMode, 'student');
+    renderJournal();
+  };
+}
+
+function updateJournalDot() {
+  const dot = $('journalDot');
+  if (!dot) return;
+  const s = parentSession();
+  dot.hidden = !(state.parentToken || hasRememberedJournal());
+  dot.dataset.state = s.status === 'none' ? 'expired' : s.status;
+}
+
+async function renderParent() {
+  paintAccessHead($('parentHead'), { studentSwitch: false });
+  updateJournalDot();
+  await loadParentJournal($('parentList'));
+}
+
+// Спільний шлях для «Журналу» і «Журналу для батьків»: той самий запам'ятаний
+// доступ, та сама картка, той самий кеш оцінок.
+async function loadParentJournal(el) {
+  if (state.parentToken) {
+    refreshPushState();
+    await fetchParentJournal(el);
+    return;
+  }
   refreshPushState();
-  fetchParentJournal();
+  const stale = cachePeek(LS.journalParent);
+  if (stale) drawJournal(stale, true, el);
+  else clear(el);
 }
 
 function scanHint(text) {
@@ -883,10 +1207,12 @@ async function startScan() {
     scanHint('Камера доступна лише за https або на localhost. Вставте код у поле нижче.');
     return;
   }
+  const seq = ++scan.seq;
   btn.disabled = true;
   btn.textContent = 'Готую камеру…';
+  let stream;
   try {
-    scan.stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' } },
       audio: false,
     });
@@ -896,6 +1222,12 @@ async function startScan() {
     scanHint('Камера недоступна (' + ((e && e.name) || 'помилка') + '). Дозвольте доступ у браузері або вставте код у поле нижче.');
     return;
   }
+  // Поки питали дозвіл, користувач пішов на іншу вкладку — камеру не вмикаємо.
+  if (seq !== scan.seq) {
+    stream.getTracks().forEach((t) => t.stop());
+    return;
+  }
+  scan.stream = stream;
   scan.video = video;
   if (!scan.canvas) {
     scan.canvas = document.createElement('canvas');
@@ -907,10 +1239,11 @@ async function startScan() {
   btn.textContent = '⏹ Припинити';
   btn.disabled = false;
   scanHint('Наведіть на QR — журнал відкриється сам.');
-  await startScanLoop();
+  await startScanLoop(seq);
 }
 
 function stopScan() {
+  scan.seq++;
   if (scan.timer) { clearInterval(scan.timer); scan.timer = null; }
   if (scan.stream) {
     scan.stream.getTracks().forEach((t) => t.stop());
@@ -945,8 +1278,10 @@ async function pickDecoder() {
   }
 }
 
-async function startScanLoop() {
+async function startScanLoop(seq) {
   const kind = await pickDecoder();
+  // Розпізнавач міг вантажитися з CDN кілька секунд — екрана вже може не бути.
+  if (seq !== scan.seq) return;
   if (!kind) {
     stopScan();
     scanHint('Не вдалося запустити розпізнавання QR. Вставте код у поле нижче.');
@@ -983,12 +1318,21 @@ async function readQrFrame(kind) {
   return res ? res.data : '';
 }
 
+// Активувати QR можна і з «Журналу», і з «Журналу для батьків» — оцінки мають
+// лишитися на екрані, тому помилка йде в підказку сканера, а не стирає список.
+function activeParentList() {
+  const jv = $('view-journal');
+  return jv && jv.classList.contains('active') ? $('journalList') : $('parentList');
+}
+
 // Код нікуди не пишеться: ні в URL, ні в консоль — він і є згода студента.
 async function activateParentCode(code) {
   if (activateBusy) return;
+  if (!code) { toast('Немає кода', 'err'); return; }
   activateBusy = true;
-  const el = $('parentList');
-  loader(el);
+  const btn = $('codeBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Перевіряємо код…'; }
+  scanHint('Перевіряємо код…');
   try {
     const res = await fetch('/api/parent/activate', {
       method: 'POST',
@@ -998,47 +1342,86 @@ async function activateParentCode(code) {
     const d = await res.json().catch(() => ({}));
     if (!res.ok || !d.token) {
       const msg = d.details || d.error || 'Не вдалося активувати код';
-      empty(el, msg);
+      scanHint(msg);
       toast(msg, 'err');
       return;
     }
     saveParent(d);
-    toast('Доступ відкрито');
-    renderParent();
+    updateJournalDot();
+    toast('Доступ відкрито — журнал запам’ятано');
+    route();
   } catch (e) {
-    empty(el, 'Сервер недоступний');
+    scanHint('Сервер недоступний — спробуйте ще раз');
     toast('Сервер недоступний', 'err');
   } finally {
     activateBusy = false;
+    const b = $('codeBtn');
+    if (b) { b.disabled = false; b.textContent = 'Відкрити журнал'; }
   }
 }
 
-async function fetchParentJournal() {
-  const el = $('parentList');
-  const cached = cacheGet(LS.journalParent, TTL.journal);
-  if (!navigator.onLine && cached) { drawJournal(cached, true, el); return; }
-  loader(el);
+// Форма відповіді /parent/journal у схемі коледжу не описана, тож ім'я беремо
+// лише якщо воно справді є — інакше картка лишається «Журнал студента».
+function labelFromJournal(data) {
+  if (!data || typeof data !== 'object') return '';
+  const s = data.student && typeof data.student === 'object' ? data.student : data;
+  const name = s.full_name || s.student_name ||
+    [s.first_name, s.last_name].filter(Boolean).join(' ');
+  const group = s.group || s.group_name || '';
+  return [name, group].filter(Boolean).join(' · ');
+}
+
+async function fetchParentJournal(el) {
+  el = el || $('parentList');
+  // Запам'ятаний журнал показуємо одразу, ще до відповіді сервера: людина
+  // повернулася в застосунок і має побачити оцінки, а не порожній екран.
+  const stale = cachePeek(LS.journalParent);
+  if (stale) drawJournal(stale, true, el);
+  else if (!navigator.onLine) { empty(el, 'Немає мережі — журнал ще не зберігається на пристрої'); return; }
+  if (!navigator.onLine) return;
+  if (!stale) loader(el);
   let data = null;
   try {
     const res = await fetch('/api/parent/journal', {
       headers: { authorization: 'Bearer ' + state.parentToken },
     });
     if (res.ok) {
-      data = cacheSet(LS.journalParent, await res.json(), TTL.journal);
-    } else if (res.status === 401) {
-      await unlinkParent();
-      renderParent();
-      empty(el, 'Доступ завершився — попросіть студента показати новий QR');
+      data = await res.json();
+      cacheSet(LS.journalParent, data, TTL.journal);
+      state.parentSeenAt = Date.now();
+      localStorage.setItem(LS.parentSeen, String(state.parentSeenAt));
+      const label = labelFromJournal(data);
+      if (label) setParentLabel(label);
+    } else if (res.status === 401 || res.status === 403) {
+      // Доступ минув — токен прибираємо, але збережені оцінки лишаємо на екрані.
+      expireParent();
+      updateJournalDot();
+      paintAccessHead(el === $('journalList') ? $('journalHead') : $('parentHead'),
+        { studentSwitch: el === $('journalList') });
+      const kept = cachePeek(LS.journalParent);
+      if (kept) drawJournal(kept, true, el);
+      else clear(el);
+      toast('Доступ завершився — потрібен новий QR', 'err');
       return;
     } else {
       const d = await res.json().catch(() => ({}));
-      empty(el, d.details || 'Не вдалося завантажити журнал');
+      if (stale) { drawJournal(stale, true, el); toast(d.details || 'Сервер журналу недоступний', 'err'); }
+      else empty(el, d.details || 'Не вдалося завантажити журнал');
       return;
     }
-  } catch (e) { }
-  if (!data && cached) data = cached;
-  if (!data) { empty(el, 'Не вдалося завантажити журнал'); return; }
+  } catch (e) {
+    if (stale) { drawJournal(stale, true, el); return; }
+    empty(el, 'Сервер недоступний — спробуйте ще раз');
+    return;
+  }
+  if (!data) { empty(el, 'Журнал порожній'); return; }
   drawJournal(data, false, el);
+  const name = $('accessName');
+  if (name) name.textContent = state.parentLabel || 'Журнал студента';
+  const sub = $('accessSub');
+  if (sub) sub.textContent = 'Оновлено ' + seenText();
+  const avatar = document.querySelector('.access-avatar');
+  if (avatar && state.parentLabel) avatar.textContent = '🎓';
 }
 
 // --- Сповіщення (Web Push) ---
@@ -1073,7 +1456,12 @@ const pushUi = {
 };
 
 function pushKind() { return localStorage.getItem(LS.pushKind) || ''; }
-function pushOn(kind) { return !!push.subscription && pushKind() === kind; }
+// Браузер може видати нову підписку (ротація FCM, очищення даних сайту) — тоді
+// запис на сервері стосується старої адреси, і «увімкнено» було б брехнею.
+function pushOn(kind) {
+  return !!push.subscription && pushKind() === kind &&
+    push.subscription.endpoint === localStorage.getItem(LS.pushEndpoint);
+}
 function setPushKind(kind) {
   if (kind) localStorage.setItem(LS.pushKind, kind);
   else localStorage.removeItem(LS.pushKind);
@@ -1091,43 +1479,54 @@ function pushCreds(kind) {
 
 function pushHint(text, kind) {
   const el = $(pushUi[kind].hint);
-  if (el) el.textContent = text;
+  if (!el) return;
+  el.textContent = text;
+  el.hidden = !text;
 }
 
 function drawPushRow(kind) {
   const btn = $(pushUi[kind].btn);
   if (!btn) return;
   const on = pushOn(kind);
+  let label;
+  let hint = '';
   if (!push.supported) {
     btn.disabled = true;
-    btn.textContent = '🔕 Сповіщення недоступні';
-    pushHint('Браузер не підтримує push. На iPhone додайте сайт на головний екран (Safari → «Поділитися» → «На екран “Домів”») і відкривайте звідти.', kind);
-    return;
-  }
-  if (isIos() && !isStandalone()) {
+    label = '🔕 Сповіщення недоступні';
+    hint = 'Браузер не підтримує push. На iPhone додайте сайт на головний екран (Safari → «Поділитися» → «На екран “Домів”») і відкривайте звідти.';
+  } else if (isIos() && !isStandalone()) {
     btn.disabled = true;
-    btn.textContent = '🔕 Сповіщення недоступні';
-    pushHint('На iPhone сповіщення працюють лише у встановленому застосунку: «Поділитися» → «На екран “Домів”», далі відкривайте застосунок звідти.', kind);
-    return;
-  }
-  if (Notification.permission === 'denied') {
+    label = '🔕 Сповіщення недоступні';
+    hint = 'На iPhone сповіщення працюють лише у встановленому застосунку: «Поділитися» → «На екран “Домів”», далі відкривайте застосунок звідти.';
+  } else if (Notification.permission === 'denied') {
     btn.disabled = true;
-    btn.textContent = '🔕 Сповіщення заборонені';
-    pushHint('Дозвіл на сповіщення можна повернути в налаштуваннях сайту в браузері.', kind);
-    return;
-  }
-  const ready = pushReady(kind);
-  btn.disabled = !ready && !on;
-  btn.textContent = on ? '🔕 Вимкнути сповіщення' : '🔔 Увімкнути сповіщення';
-  if (!ready) {
-    pushHint(kind === 'parent'
-      ? 'Спершу відскануйте QR — інакше немає чий журнал перевіряти.'
-      : 'Спершу увійдіть — інакше немає кого перевіряти в журналі.', kind);
-  } else if (push.subscription && !on) {
-    pushHint('Сповіщення зараз налаштовані на інший журнал. Увімкнення тут переве їх на цей.', kind);
+    label = '🔕 Сповіщення заборонені';
+    hint = 'Дозвіл на сповіщення можна повернути в налаштуваннях сайту в браузері.';
   } else {
-    pushHint('Сповіщення приходять, коли в журналі з’явиться нова оцінка. Журнал перевіряється двічі на годину.', kind);
+    const ready = pushReady(kind);
+    btn.disabled = !ready && !on;
+    label = on ? '🔕 Вимкнути сповіщення' : '🔔 Увімкнути сповіщення';
+    if (!ready) {
+      hint = kind === 'parent'
+        ? 'Спершу відскануйте QR — інакше немає чий журнал перевіряти.'
+        : 'Спершу увійдіть — інакше немає кого перевіряти в журналі.';
+    } else if (push.subscription && !on) {
+      hint = 'Сповіщення зараз налаштовані на інший журнал. Увімкнення тут переве їх на цей.';
+    } else if (kind !== 'parent') {
+      hint = 'Сповіщення приходять, коли в журналі з’явиться нова оцінка. Журнал перевіряється двічі на годину.';
+    }
   }
+  // У компактній картці кнопка push — іконка: повний текст лишається в title
+  // та aria-label, щоб смуга не роздувалася на цілий рядок.
+  if (btn.dataset.icon) {
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    btn.textContent = label.slice(0, 2);
+    btn.classList.toggle('is-on', on && !btn.disabled);
+  } else {
+    btn.textContent = label;
+  }
+  pushHint(hint, kind);
 }
 
 async function pushRegistration() {
@@ -1159,7 +1558,25 @@ async function sendPushSubscription(sub, kind) {
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || ('HTTP ' + res.status));
+    throw new Error(data.details || data.error || ('HTTP ' + res.status));
+  }
+}
+
+// Перереєструвати наявну підписку під нові реквізити (новий QR або інший акаунт).
+// Якщо не вийшло — знімаємо позначку «увімкнено», щоб інтерфейс не брехав.
+async function resyncPush(kind) {
+  if (pushKind() !== kind) return;
+  try {
+    const reg = await pushRegistration();
+    const sub = await reg.pushManager.getSubscription();
+    if (!sub) throw new Error('немає підписки');
+    push.subscription = sub;
+    await sendPushSubscription(sub, kind);
+    localStorage.setItem(LS.pushEndpoint, sub.endpoint);
+  } catch (e) {
+    push.subscription = null;
+    setPushKind('');
+    localStorage.removeItem(LS.pushEndpoint);
   }
 }
 
@@ -1190,6 +1607,7 @@ async function enablePush(kind) {
     push.subscription = sub;
     await sendPushSubscription(sub, kind);
     setPushKind(kind);
+    localStorage.setItem(LS.pushEndpoint, sub.endpoint);
     toast('Сповіщення увімкнено');
   } catch (e) {
     toast('Не вдалося увімкнути сповіщення: ' + (e.message || e), 'err');
@@ -1211,6 +1629,7 @@ async function disablePush() {
     }
     push.subscription = null;
     setPushKind('');
+    localStorage.removeItem(LS.pushEndpoint);
     toast('Сповіщення вимкнено');
   } catch (e) {
     toast('Не вдалося вимкнути сповіщення', 'err');
@@ -1316,11 +1735,16 @@ function drawPayments(data) {
       '<div class="pay-line">IBAN: <b>' + esc(p.IBAN) + '</b> <button class="copy-btn" data-copy="' + esc(p.IBAN) + '">копія</button></div>' +
       '<div class="pay-line">Призначення: <b>' + esc(purpose) + '</b> <button class="copy-btn" data-copy="' + esc(purpose) + '">копія</button></div></div>';
   }).join('');
-  el.querySelectorAll('.copy-btn').forEach((b) => b.onclick = () => {
+  el.querySelectorAll('.copy-btn').forEach((b) => b.onclick = async () => {
     const v = b.dataset.copy;
-    if (navigator.clipboard) navigator.clipboard.writeText(v);
+    let ok = false;
+    try {
+      if (navigator.clipboard) { await navigator.clipboard.writeText(v); ok = true; }
+    } catch (e) { }
+    // «готово ✓» без перевірки — це брехня: буфер може бути заборонений.
+    if (!ok) { toast('Не вдалося скопіювати — видіть текст вручну', 'err'); return; }
     b.textContent = 'готово ✓';
-    setTimeout(() => b.textContent = 'копія', 1200);
+    setTimeout(() => { b.textContent = 'копія'; }, 1200);
   });
 }
 
@@ -1349,10 +1773,18 @@ function renderMore() {
   renderPayments();
 }
 
+const VIEWS = ['schedule', 'journal', 'news', 'parent', 'more'];
+
 async function route() {
   const hash = location.hash || '#/schedule';
-  const name = hash.replace('#/', '').split('/')[0] || 'schedule';
-  setView(['schedule', 'journal', 'news', 'parent', 'more'].includes(name) ? name : 'schedule');
+  const raw = hash.replace('#/', '').split('/')[0];
+  // Невідома адреса має показати розклад, а не порожній екран без жодного рендера.
+  const name = VIEWS.includes(raw) ? raw : 'schedule';
+  // Камера не повинна світитися, коли екрана зі сканером уже немає. Сканер
+  // живе і в «Журналі» (поновлення доступу), тож перевіряємо обидва.
+  if (name !== 'parent' && name !== 'journal') unmountScanner();
+  setView(name);
+  updateJournalDot();
   if (name === 'schedule') renderSchedule();
   else if (name === 'journal') renderJournal();
   else if (name === 'news') renderNews();
@@ -1367,6 +1799,10 @@ document.querySelectorAll('.seg').forEach((b) => b.onclick = () => {
   renderSchedule();
 });
 window.addEventListener('hashchange', route);
+window.addEventListener('pagehide', () => { unmountScanner(); stopAccessTimer(); });
+// З фонової вкладки інтервал міг не тікати рівно — відлік рахується від Date.now(),
+// тож після повернення одразу показує справжній залишок, а не завмерлий.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) tickAccess(); });
 $('themeBtn').onclick = () => applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
 
 if ('serviceWorker' in navigator) {
